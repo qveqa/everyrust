@@ -7,6 +7,8 @@
 графическое приложение `everyrust-gui`, командную утилиту `everyrust` и библиотеку
 `everyrust`.
 
+![Окно EveryRust со списком файлов](assets/everyrust-window.png)
+
 ## Быстрый запуск
 
 Скачайте архив Windows x64 из раздела **Releases**, распакуйте его и запустите

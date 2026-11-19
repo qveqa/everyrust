@@ -7,6 +7,8 @@ paths, and metadata in memory, then filters results as you type. The project
 includes the `everyrust-gui` desktop app, the `everyrust` command-line tool,
 and the `everyrust` Rust library.
 
+![EveryRust window showing file search results](assets/everyrust-window.png)
+
 ## Quick start
 
 Download the Windows x64 archive from **Releases**, extract it, and run
