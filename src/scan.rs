@@ -1,15 +1,15 @@
 //! Parallel directory scanner.
 //!
 //! The scanner walks a root folder and produces one [`Entry`] per file and
-//! directory below it (the root itself is not included). Directories at each
-//! depth are walked in parallel with Rayon. Reparse points (junctions, symlinks) are recorded but not descended
-//! into, which keeps the walk cycle-free on Windows.
+//! directory below it (the root itself is not included). Directories are
+//! scheduled as they are found. Reparse points (junctions, symlinks) are
+//! recorded but not descended into, which keeps the walk cycle-free on Windows.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 
 use crate::model::Entry;
 use crate::timeutil;
@@ -50,42 +50,71 @@ pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
     // Walk through an extended-length (`\\?\`) root so files deeper than
     // MAX_PATH are still reachable without a longPathAware manifest.
     #[cfg(windows)]
-    let mut directories = vec![extended_path(&std::path::absolute(root)?)];
+    let directory = extended_path(&std::path::absolute(root)?);
     #[cfg(not(windows))]
-    let mut directories = vec![root.to_path_buf()];
+    let directory = root.to_path_buf();
 
-    let mut entries = Vec::new();
-    let mut stats = ScanStats::default();
-    let debug_scan = std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some();
-    while !directories.is_empty() {
-        let level = directories
-            .par_iter()
-            .fold(ScanLevel::default, |mut level, directory| {
-                level.read_dir(directory, debug_scan);
-                level
-            })
-            .reduce(ScanLevel::default, |mut left, mut right| {
-                left.entries.append(&mut right.entries);
-                left.directories.append(&mut right.directories);
-                left.unreadable += right.unreadable;
-                left
-            });
-        entries.extend(level.entries);
-        stats.unreadable += level.unreadable;
-        directories = level.directories;
+    Ok(scan_directories(vec![directory]))
+}
+
+fn scan_directories(directories: Vec<PathBuf>) -> (Vec<Entry>, ScanStats) {
+    if directories.is_empty() {
+        return (Vec::new(), ScanStats::default());
     }
-    Ok((entries, stats))
+    // Each task writes to its own worker's buffer. This avoids copying
+    // intermediate results while the directory tree is being walked.
+    let workers: Vec<Mutex<ScanBatch>> = (0..rayon::current_num_threads())
+        .map(|_| Mutex::new(ScanBatch::default()))
+        .collect();
+    let debug_scan = std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some();
+    rayon::scope_fifo(|scope| {
+        for directory in directories {
+            schedule_directory(scope, directory, &workers, debug_scan);
+        }
+    });
+
+    let batches: Vec<ScanBatch> = workers
+        .into_iter()
+        .map(|batch| batch.into_inner().unwrap())
+        .collect();
+    let count = batches.iter().map(|batch| batch.entries.len()).sum();
+    let mut entries = Vec::with_capacity(count);
+    let mut stats = ScanStats::default();
+    for mut batch in batches {
+        entries.append(&mut batch.entries);
+        stats.unreadable += batch.unreadable;
+    }
+    (entries, stats)
+}
+
+fn schedule_directory<'scope>(
+    scope: &rayon::ScopeFifo<'scope>,
+    directory: PathBuf,
+    workers: &'scope [Mutex<ScanBatch>],
+    debug_scan: bool,
+) {
+    scope.spawn_fifo(move |scope| {
+        let worker = rayon::current_thread_index().expect("directory scan ran outside Rayon");
+        let mut batch = workers[worker].lock().unwrap();
+        batch.read_dir(&directory, debug_scan, |child| {
+            schedule_directory(scope, child, workers, debug_scan);
+        });
+    });
 }
 
 #[derive(Default)]
-struct ScanLevel {
+struct ScanBatch {
     entries: Vec<Entry>,
-    directories: Vec<PathBuf>,
     unreadable: usize,
 }
 
-impl ScanLevel {
-    fn read_dir(&mut self, directory: &Path, debug_scan: bool) {
+impl ScanBatch {
+    fn read_dir(
+        &mut self,
+        directory: &Path,
+        debug_scan: bool,
+        mut visit_directory: impl FnMut(PathBuf),
+    ) {
         let children = match fs::read_dir(directory) {
             Ok(children) => children,
             Err(error) => {
@@ -121,7 +150,7 @@ impl ScanLevel {
                 None => child.file_type().is_ok_and(|kind| kind.is_dir()),
             };
             if is_dir && attributes.unwrap_or(0) & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-                self.directories.push(directory.join(&name));
+                visit_directory(directory.join(&name));
             }
             self.entries.push(entry_with_metadata(path, metadata, is_dir));
         }
@@ -137,23 +166,11 @@ impl ScanLevel {
 
 /// Scans every fixed local drive (e.g. `C:\`, `D:\`) and merges the results.
 pub fn scan_local_drives() -> Result<(Vec<Entry>, ScanStats)> {
-    let drives = local_fixed_drives();
-    if drives.is_empty() {
-        return Ok((Vec::new(), ScanStats::default()));
-    }
-
-    let mut entries = Vec::new();
-    let mut stats = ScanStats::default();
-    for drive in &drives {
-        match scan_with_stats(drive) {
-            Ok((mut drive_entries, drive_stats)) => {
-                entries.append(&mut drive_entries);
-                stats.unreadable += drive_stats.unreadable;
-            }
-            Err(_) => stats.unreadable += 1,
-        }
-    }
-    Ok((entries, stats))
+    let directories = local_fixed_drives()
+        .into_iter()
+        .map(|drive| extended_path(&drive))
+        .collect();
+    Ok(scan_directories(directories))
 }
 
 /// The fixed local drives as root paths (`C:\`, `D:\`, ...).
@@ -188,7 +205,6 @@ pub fn local_fixed_drives() -> Vec<PathBuf> {
 }
 
 /// `C:\dir` -> `\\?\C:\dir` so the Windows API accepts paths over MAX_PATH.
-#[cfg(windows)]
 fn extended_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if text.starts_with(r"\\?\") {

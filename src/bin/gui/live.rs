@@ -12,7 +12,6 @@ use everyrust::model::Entry;
 use everyrust::scan;
 use everyrust::search::{self, SearchIndex, SortKey};
 
-const LIVE_SIZE_LIMIT: u64 = 500 * 1024 * 1024;
 const BATCH_WINDOW: Duration = Duration::from_millis(220);
 
 pub enum Update {
@@ -139,17 +138,13 @@ fn resolve(paths: HashMap<PathBuf, bool>) -> HashMap<PathBuf, Option<Entry>> {
             continue;
         }
         if let Ok(entries) = scan::scan(&root) {
-            for entry in entries.into_iter().filter(eligible) {
+            for entry in entries {
                 resolved.entry(entry.path.clone()).or_insert(Some(entry));
             }
         }
         last_root = Some(root);
     }
     resolved
-}
-
-fn eligible(entry: &Entry) -> bool {
-    entry.is_dir || entry.size.is_some_and(|size| size < LIVE_SIZE_LIMIT)
 }
 
 pub fn find(index: &SearchIndex, order: &[usize], path: &Path) -> Option<usize> {
@@ -174,11 +169,10 @@ pub fn apply(
         match entry {
             Some(entry) => {
                 if let Some(id) = find(index, path_order, &path) {
-                    let old = index.entry(id);
-                    if *old != entry && (eligible(old) || eligible(&entry)) {
+                    if *index.entry(id) != entry {
                         replacements.insert(id, entry);
                     }
-                } else if eligible(&entry) {
+                } else {
                     added.push(entry);
                 }
             }
@@ -186,8 +180,7 @@ pub fn apply(
                 let start = path_order.partition_point(|&id| index.entry(id).path < path);
                 removed.extend(
                     path_order[start..].iter().copied()
-                        .take_while(|&id| index.entry(id).path.starts_with(&path))
-                        .filter(|&id| eligible(index.entry(id))),
+                        .take_while(|&id| index.entry(id).path.starts_with(&path)),
                 );
             }
         }
@@ -250,14 +243,14 @@ mod tests {
     }
 
     #[test]
-    fn batch_preserves_order_and_updates_only_eligible_files() {
-        let large = file("sub/large.txt", LIVE_SIZE_LIMIT);
+    fn batch_preserves_order_for_files_of_all_sizes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
         let mut index = SearchIndex::new(
             vec![
                 file("sub/a.txt", 2),
                 file("sub/b.txt", 3),
-                file("outside.txt", 22),
-                large.clone(),
+                file("outside.txt", GIB),
+                file("sub/large.txt", GIB),
                 file("sub/c.txt", 5),
                 file("keep.txt", 9),
             ],
@@ -273,18 +266,19 @@ mod tests {
 
         let changes = HashMap::from([
             (PathBuf::from("sub"), None),
-            (PathBuf::from("outside.txt"), Some(file("outside.txt", 4))),
+            (PathBuf::from("outside.txt"), Some(file("outside.txt", 2 * GIB))),
             (PathBuf::from("new.txt"), Some(file("new.txt", 17))),
-            (PathBuf::from("too-big.txt"), Some(file("too-big.txt", LIVE_SIZE_LIMIT))),
+            (PathBuf::from("new-large.txt"), Some(file("new-large.txt", GIB))),
         ]);
         assert!(apply(&mut index, &mut paths, &mut order, (SortKey::Size, true), changes));
         assert_eq!(index.len(), 4);
         assert_eq!(paths.iter().map(|&id| index.entry(id).name_string()).collect::<Vec<_>>(),
-            ["keep.txt", "new.txt", "outside.txt", "large.txt"]);
+            ["keep.txt", "new-large.txt", "new.txt", "outside.txt"]);
         assert_eq!(order.iter().map(|&id| index.entry(id).name_string()).collect::<Vec<_>>(),
-            ["large.txt", "new.txt", "keep.txt", "outside.txt"]);
+            ["outside.txt", "new-large.txt", "new.txt", "keep.txt"]);
+        assert_eq!(index.entry(order[0]).size, Some(2 * GIB));
         let hits = search::filter_ordered_indices(&index, &query, &order);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(index.entry(hits[0]).name_string(), "new.txt");
+        assert_eq!(hits.iter().map(|&id| index.entry(id).name_string()).collect::<Vec<_>>(),
+            ["new-large.txt", "new.txt"]);
     }
 }

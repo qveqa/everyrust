@@ -13,7 +13,7 @@ and the `everyrust` Rust library.
 
 Download the Windows x64 archive from **Releases**, extract it, and run
 `everyrust-gui.exe`. The app runs without installation. A prebuilt executable
-in a local project folder is available at `dist/everyrust-gui.exe`.
+in a local project folder is available at `dist/everyrust.exe`.
 
 By default, the app scans fixed local drives and requests administrator
 privileges. To scan a single folder with your current privileges, run this
@@ -36,7 +36,8 @@ monitoring. Bookmarks and search history are kept for the current session.
   **Copy Path**. Click an empty area to clear the selection.
 - `Ctrl+F` focuses the search box, `Ctrl+C` copies the selected item's full
   path, and `F5` rescans the current source.
-- Changes to files smaller than 500 MiB appear automatically in indexed
+- `Del` moves the selected file to the Windows Recycle Bin and removes it from the results.
+- Changes to files of any size appear automatically in indexed
   folders and on local drives. Press `F5` for a full rescan. Imported file
   lists are snapshots.
 - The status bar shows the result count, access errors, and details about

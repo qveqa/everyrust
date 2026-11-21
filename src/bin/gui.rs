@@ -5,7 +5,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
@@ -33,6 +33,7 @@ const HEADER_HEIGHT: f32 = 24.0;
 const FONT_SIZE: f32 = 12.0;
 const COLUMN_GRIP: f32 = 4.0;
 const ACCENT: Color32 = Color32::WHITE;
+const SEARCH_FIELD_ID: &str = "search_field";
 
 fn main() -> eframe::Result<()> {
     // Elevation allows the scanner to read more protected folders.
@@ -95,6 +96,7 @@ struct App {
     hits: Vec<usize>,
     result_order: Vec<usize>,
     path_order: Vec<usize>,
+    deleted_files: HashSet<PathBuf>,
     watch: Option<live::Watch>,
     live_warning: Option<String>,
     order_sort: (SortKey, bool),
@@ -145,6 +147,7 @@ impl App {
             hits: Vec::new(),
             result_order: Vec::new(),
             path_order: Vec::new(),
+            deleted_files: HashSet::new(),
             watch: None,
             live_warning: None,
             order_sort: (SortKey::Size, true),
@@ -232,6 +235,7 @@ impl App {
         load: impl FnOnce() -> anyhow::Result<(Vec<Entry>, usize)> + Send + 'static,
     ) {
         self.watch = None;
+        self.deleted_files.clear();
         self.live_warning = None;
         self.scanning = true;
         self.status_error = None;
@@ -324,6 +328,24 @@ impl App {
                 }
             }
         }
+        // The watcher may have captured an update before a file was recycled.
+        changes.retain(|path, entry| {
+            if !self.deleted_files.contains(path) {
+                return true;
+            }
+            if entry.is_some() {
+                let Ok(current) = scan::read_entry(path.clone()) else {
+                    return false;
+                };
+                *entry = Some(current);
+            }
+            self.deleted_files.remove(path);
+            true
+        });
+        self.apply_index_changes(changes);
+    }
+
+    fn apply_index_changes(&mut self, changes: HashMap<PathBuf, Option<Entry>>) {
         if changes.is_empty() {
             return;
         }
@@ -467,6 +489,9 @@ impl App {
         if page_up {
             self.move_selection(-15);
         }
+        if (down || up || page_down || page_up) && self.selected.is_some() {
+            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::unique(SEARCH_FIELD_ID)));
+        }
         if enter {
             self.record_search();
             self.pending = Some(Action::OpenSelected);
@@ -474,6 +499,52 @@ impl App {
         if copy {
             self.pending = Some(Action::CopySelectedPath);
         }
+        if self.pending.is_none()
+            && !self.scanning
+            && !self.show_about
+            && !self.focus_search
+            && !ctx.memory(|memory| memory.has_focus(egui::Id::unique(SEARCH_FIELD_ID)))
+            && ctx.input(|input| {
+                input.events.iter().any(|event| matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::Delete,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                        ..
+                    }
+                ))
+            })
+        {
+            self.delete_selected_file();
+        }
+    }
+
+    fn delete_selected_file(&mut self) {
+        let Some(entry) = self.selected_entry().filter(|entry| !entry.is_dir) else {
+            return;
+        };
+        let path = entry.path.clone();
+        match recycle_file(&path) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.status_error = Some(format!("Could not delete {}: {error}", path.display()));
+                return;
+            }
+        }
+        // Imported lists build the path order on demand.
+        if let Some(index) = &self.index {
+            if self.path_order.is_empty() {
+                self.path_order.extend(0..index.len());
+                search::sort_hits(index, &mut self.path_order, SortKey::Path, false);
+            }
+        }
+        if self.watch.is_some() {
+            self.deleted_files.insert(path.clone());
+        }
+        self.apply_index_changes(HashMap::from([(path, None)]));
     }
 
     fn actions_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -629,6 +700,7 @@ impl eframe::App for App {
                 let response = ui.add_sized(
                     [ui.available_width(), 24.0],
                     egui::TextEdit::singleline(&mut self.query)
+                        .id(egui::Id::unique(SEARCH_FIELD_ID))
                         .desired_width(f32::INFINITY),
                 );
                 if self.focus_search {
@@ -768,6 +840,7 @@ impl eframe::App for App {
         }
         if let Some(row) = event.select {
             self.selected = Some(row);
+            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::unique(SEARCH_FIELD_ID)));
         } else if event.clear_selection {
             self.selected = None;
         }
@@ -1483,10 +1556,86 @@ fn relaunch_as_admin(_arguments: &[String]) -> bool {
     false
 }
 
+#[cfg(windows)]
 fn reveal_path(path: &Path) {
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{}", path.display()))
+    use std::ffi::OsString;
+    use std::os::windows::process::CommandExt;
+
+    let path = path.as_os_str();
+    if path.as_encoded_bytes().contains(&b'"') {
+        return;
+    }
+
+    // Explorer expects quotes around the path after the comma.
+    let mut argument = OsString::from("/select,\"");
+    argument.push(path);
+    argument.push("\"");
+
+    let _ = std::process::Command::new("explorer.exe")
+        .raw_arg(argument)
         .spawn();
+}
+
+#[cfg(not(windows))]
+fn reveal_path(_path: &Path) {}
+
+#[cfg(windows)]
+fn recycle_file(path: &Path) -> anyhow::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    use windows_sys::Win32::UI::Shell::{
+        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_NO_CONNECTED_ELEMENTS,
+        FOF_WANTNUKEWARNING, FO_DELETE, SHFILEOPSTRUCTW, SHFileOperationW,
+    };
+
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            let bytes = name.as_encoded_bytes();
+            anyhow::ensure!(
+                !bytes.ends_with(b".") && !bytes.ends_with(b" ")
+                    && !bytes.iter().any(|&byte| matches!(byte, 0..=31 | b':' | b'*' | b'?')),
+                "Windows Shell cannot safely recycle this path"
+            );
+        }
+    }
+    let path = std::path::absolute(path)?;
+    let ordinary_path = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..))
+    );
+    let mut source: Vec<u16> = path.as_os_str().encode_wide().collect();
+    anyhow::ensure!(
+        ordinary_path && !source.iter().any(|&unit| matches!(unit, 0 | 42 | 63)),
+        "Windows Shell cannot safely recycle this path"
+    );
+    match scan::read_entry(path) {
+        Ok(entry) if entry.is_dir => anyhow::bail!("The path now points to a folder"),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    }
+
+    // The Shell expects a double-NUL-terminated list of full paths.
+    source.extend([0, 0]);
+    let mut operation = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: source.as_ptr(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI
+            | FOF_NO_CONNECTED_ELEMENTS | FOF_WANTNUKEWARNING) as u16,
+        ..Default::default()
+    };
+    let result = unsafe { SHFileOperationW(&mut operation) };
+    if result == 0 && operation.fAnyOperationsAborted != 0 {
+        return Ok(false);
+    }
+    anyhow::ensure!(result == 0, "Windows Shell error {result:#x}");
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn recycle_file(_path: &Path) -> anyhow::Result<bool> {
+    anyhow::bail!("Moving files to the Recycle Bin requires Windows");
 }
 
 fn load_fonts(ctx: &egui::Context) {
