@@ -1561,19 +1561,61 @@ fn reveal_path(path: &Path) {
     use std::ffi::OsString;
     use std::os::windows::process::CommandExt;
 
-    let path = path.as_os_str();
-    if path.as_encoded_bytes().contains(&b'"') {
-        return;
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    std::thread::spawn(move || {
+        if open_and_select_in_explorer(&path) {
+            return;
+        }
+
+        let path = path.as_os_str();
+        if path.as_encoded_bytes().contains(&b'"') {
+            return;
+        }
+
+        // Explorer expects quotes around the path after the comma.
+        let mut argument = OsString::from("/select,\"");
+        argument.push(path);
+        argument.push("\"");
+
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(argument)
+            .spawn();
+    });
+}
+
+#[cfg(windows)]
+fn open_and_select_in_explorer(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null;
+
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
+    use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+
+    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return false;
     }
+    path.push(0);
 
-    // Explorer expects quotes around the path after the comma.
-    let mut argument = OsString::from("/select,\"");
-    argument.push(path);
-    argument.push("\"");
-
-    let _ = std::process::Command::new("explorer.exe")
-        .raw_arg(argument)
-        .spawn();
+    // The Shell call runs on a dedicated STA thread and opens the parent
+    // folder with the item selected and scrolled into view.
+    unsafe {
+        if CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) < 0 {
+            return false;
+        }
+        let item = ILCreateFromPathW(path.as_ptr());
+        let opened = if item.is_null() {
+            false
+        } else {
+            let result = SHOpenFolderAndSelectItems(item, 0, null(), 0);
+            ILFree(item);
+            result >= 0
+        };
+        CoUninitialize();
+        opened
+    }
 }
 
 #[cfg(not(windows))]
