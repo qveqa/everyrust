@@ -123,8 +123,13 @@ that are reparse points, such as OneDrive cloud folders; the directory walk
 does not enter those folders.
 
 The status bar shows how the index was built and how long it took, for
-example `indexed in 0.42 s (MFT)`. When the MFT cannot be read, the tooltip of
-this text shows why.
+example `indexed in 2.05 s (MFT)`. The tooltip of this text shows where the
+MFT read time went, or why the MFT could not be read.
+
+The disk limits how fast the MFT can be read. On the test PC with an NVMe SSD
+(878,000 files, an 840 MiB MFT), reading took about 2 s at 460 MiB/s. The
+directory walk took 1.1 s with a warm Windows cache and 2.3 s without it. The
+window shows the saved index at once in both cases.
 
 After each scan, the index is saved to `%LOCALAPPDATA%\EveryRust`. On the
 next start, the window shows the saved index at once with `Updating…`, and the

@@ -121,8 +121,8 @@ struct App {
     showing_saved: bool,
     /// How the last scan went, for the status bar.
     scan_note: Option<String>,
-    /// Why the MFT could not be read, shown as a tooltip.
-    mft_error: Option<String>,
+    /// Why the MFT could not be read, or where the scan time went; shown as a tooltip.
+    scan_tooltip: Option<String>,
     status_error: Option<String>,
     unreadable: usize,
     elevated: bool,
@@ -192,7 +192,7 @@ impl App {
             receiver: None,
             showing_saved: false,
             scan_note: None,
-            mft_error: None,
+            scan_tooltip: None,
             status_error: None,
             unreadable: 0,
             elevated: is_elevated(),
@@ -368,13 +368,16 @@ impl App {
         self.order_sort = scan.sort;
         self.unreadable = scan.info.unreadable;
         self.scan_note = Some(format!(
-            "{} in {:.2} s ({}{})",
+            "{} in {:.2} s ({})",
             if scan.info.method == "saved index" { "loaded" } else { "indexed" },
             scan.took.as_secs_f64(),
             scan.info.method,
-            scan.info.details.as_deref().map(|details| format!(": {details}")).unwrap_or_default(),
         ));
-        self.mft_error = scan.info.mft_error;
+        self.scan_tooltip = match (scan.info.details, scan.info.mft_error) {
+            (Some(details), _) => Some(format!("MFT: {details}")),
+            (None, Some(error)) => Some(format!("MFT unavailable: {error}")),
+            (None, None) => None,
+        };
         self.recompute();
         // Keep the selection when the fresh index replaces the saved one.
         if let (Some(path), Some(index)) = (selected_path, &self.index) {
@@ -836,8 +839,8 @@ impl eframe::App for App {
                     }
                     if let Some(note) = &self.scan_note {
                         let label = ui.weak(format!("· {note}"));
-                        if let Some(error) = &self.mft_error {
-                            label.on_hover_text(format!("MFT unavailable: {error}"));
+                        if let Some(tooltip) = &self.scan_tooltip {
+                            label.on_hover_text(tooltip);
                         }
                     }
                     if let Some(entry) = self.selected_entry() {

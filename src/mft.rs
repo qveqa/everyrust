@@ -81,8 +81,10 @@ pub fn scan_volume_root(root: &Path) -> Result<(Vec<Entry>, Report)> {
     let setting = |name: &str| std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok());
     let readers = match setting("EVERYRUST_MFT_READERS") {
         Some(readers) => readers as usize,
+        // Measured on an NVMe SSD: 4 readers were fastest, and 16 or more
+        // were slower than one.
         None if incurs_seek_penalty(&device) => 1,
-        None => 16,
+        None => 4,
     };
     let block_bytes = setting("EVERYRUST_MFT_BLOCK_KIB").map_or(DEFAULT_BLOCK_BYTES, |kib| kib << 10);
     read_volume(open, readers, block_bytes, &display)
