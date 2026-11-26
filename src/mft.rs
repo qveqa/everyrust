@@ -23,8 +23,8 @@ use crate::model::Entry;
 const ROOT_RECORD: u64 = 5;
 /// Records below this number are NTFS metadata files such as `$MFT`.
 const FIRST_USER_RECORD: u64 = 16;
-/// Bytes read per block. A multiple of every valid cluster and record size.
-const BLOCK_BYTES: u64 = 4 << 20;
+/// Default bytes read per block. A multiple of every valid cluster and record size.
+pub const DEFAULT_BLOCK_BYTES: u64 = 4 << 20;
 /// Alignment of read buffers. Raw volume reads bypass the file cache, so
 /// buffers must be aligned to the sector size; a page covers every disk.
 const BUFFER_ALIGN: usize = 4096;
@@ -67,14 +67,25 @@ pub fn scan_volume_root(root: &Path) -> Result<(Vec<Entry>, Report)> {
     let text = root.to_str().context("not a drive root")?;
     let display = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text));
     let device = format!(r"\\.\{letter}:");
+    // Read straight into our aligned buffers instead of through the file
+    // cache, which reads a volume in small pieces and copies every byte.
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    let buffered = std::env::var_os("EVERYRUST_MFT_BUFFERED").is_some();
     let open = || {
         std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(if buffered { 0 } else { FILE_FLAG_NO_BUFFERING })
             .open(&device)
     };
-    let readers = if incurs_seek_penalty(&device) { 1 } else { 8 };
-    read_volume(open, readers, &display)
+    let setting = |name: &str| std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok());
+    let readers = match setting("EVERYRUST_MFT_READERS") {
+        Some(readers) => readers as usize,
+        None if incurs_seek_penalty(&device) => 1,
+        None => 16,
+    };
+    let block_bytes = setting("EVERYRUST_MFT_BLOCK_KIB").map_or(DEFAULT_BLOCK_BYTES, |kib| kib << 10);
+    read_volume(open, readers, block_bytes, &display)
 }
 
 /// Whether the disk under a volume is a hard disk. SSDs report no seek
@@ -137,7 +148,7 @@ pub fn drive_root_letter(root: &Path) -> Option<char> {
 /// is fastest with many reads in flight. Other threads parse the blocks
 /// already read. Blocks without records in use, according to the `$MFT`
 /// bitmap, are skipped.
-pub fn read_volume<R, F>(open: F, readers: usize, root: &Path) -> Result<(Vec<Entry>, Report)>
+pub fn read_volume<R, F>(open: F, readers: usize, block_bytes: u64, root: &Path) -> Result<(Vec<Entry>, Report)>
 where
     R: Read + Seek + Send,
     F: Fn() -> io::Result<R> + Sync,
@@ -154,7 +165,14 @@ where
     // Only records that are actually allocated can be read.
     let records = layout.data_size.min(read_end) / record_size;
     ensure!(records <= u64::from(u32::MAX), "the MFT has too many records");
-    let records_per_block = BLOCK_BYTES / record_size;
+    ensure!(
+        block_bytes.is_power_of_two()
+            && (64 << 10..=64 << 20).contains(&block_bytes)
+            && block_bytes >= record_size
+            && block_bytes >= layout.geometry.cluster_size,
+        "invalid MFT block size {block_bytes}"
+    );
+    let records_per_block = block_bytes / record_size;
     let block_count = usize::try_from(records.div_ceil(records_per_block)).context("the MFT is too large")?;
     let in_use = |number: u64| {
         layout.bitmap.as_ref().is_none_or(|bitmap| {
@@ -225,8 +243,8 @@ where
                                     Err(_) => return Ok(()),
                                 },
                             };
-                            let start = block as u64 * BLOCK_BYTES;
-                            buffer.resize(((read_end - start).min(BLOCK_BYTES)) as usize);
+                            let start = block as u64 * block_bytes;
+                            buffer.resize(((read_end - start).min(block_bytes)) as usize);
                             layout
                                 .read(&mut volume, start, &mut buffer)
                                 .with_context(|| format!("cannot read MFT block at offset {start}"))?;
@@ -274,7 +292,7 @@ where
     });
     read_results.into_iter().collect::<Result<()>>()?;
     let read_time = started.elapsed() - layout_time;
-    let read_bytes = wanted.iter().map(|&block| (read_end - block as u64 * BLOCK_BYTES).min(BLOCK_BYTES)).sum();
+    let read_bytes = wanted.iter().map(|&block| (read_end - block as u64 * block_bytes).min(block_bytes)).sum();
 
     let mut blocks: Vec<Block> = (0..block_count).map(|_| Block::default()).collect();
     for (index, block) in parsed {
@@ -286,6 +304,7 @@ where
         mft_bytes: read_end,
         read_bytes,
         readers,
+        block_bytes,
         layout_time,
         read_time,
         build_time: build_started.elapsed(),
@@ -301,6 +320,7 @@ pub struct Report {
     /// Bytes read; blocks without records in use are skipped.
     pub read_bytes: u64,
     pub readers: usize,
+    pub block_bytes: u64,
     /// Opening the volume and reading the boot sector and `$MFT` layout.
     pub layout_time: std::time::Duration,
     /// Reading and parsing the records; the two overlap.
@@ -314,13 +334,14 @@ impl std::fmt::Display for Report {
         let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
         write!(
             f,
-            "{:.0} of {:.0} MiB, open {:.2} s, read {:.2} s ({:.0} MiB/s, {} reader(s)), build {:.2} s",
+            "{:.0} of {:.0} MiB, open {:.2} s, read {:.2} s ({:.0} MiB/s, {} reader(s), {} KiB blocks), build {:.2} s",
             mib(self.read_bytes),
             mib(self.mft_bytes),
             self.layout_time.as_secs_f64(),
             self.read_time.as_secs_f64(),
             mib(self.read_bytes) / self.read_time.as_secs_f64().max(1e-6),
             self.readers,
+            self.block_bytes >> 10,
             self.build_time.as_secs_f64(),
         )
     }
@@ -461,14 +482,20 @@ impl Layout {
         // its $ATTRIBUTE_LIST.
         let extensions = layout.attribute_list_extensions(volume, record)?;
         for number in extensions {
-            let mut extension = AlignedBuffer::new(geometry.record_size as usize);
             let offset = number
                 .checked_mul(geometry.record_size)
                 .context("invalid MFT extension record")?;
-            layout.read(volume, offset, &mut extension)?;
-            ensure!(apply_fixups(&mut extension), "MFT extension record {number} is damaged");
-            collect_segments(&extension, ATTR_DATA, &mut segments)?;
-            bitmap = bitmap.or_else(|| collect_bitmap(&extension, &mut bitmap_segments));
+            // Uncached reads must cover whole sectors: read whole clusters.
+            let cluster = geometry.cluster_size;
+            let start = offset / cluster * cluster;
+            let end = round_up(offset + geometry.record_size, cluster);
+            let mut clusters = AlignedBuffer::new((end - start) as usize);
+            layout.read(volume, start, &mut clusters)?;
+            let inner = (offset - start) as usize;
+            let extension = &mut clusters[inner..inner + geometry.record_size as usize];
+            ensure!(apply_fixups(extension), "MFT extension record {number} is damaged");
+            collect_segments(extension, ATTR_DATA, &mut segments)?;
+            bitmap = bitmap.or_else(|| collect_bitmap(extension, &mut bitmap_segments));
         }
         if !segments.is_empty() {
             layout = Self::from_segments(geometry, &segments)?;
@@ -1306,7 +1333,8 @@ mod tests {
         let mount = PathBuf::from(std::env::var_os("EVERYRUST_NTFS_MOUNT").unwrap());
         let started = std::time::Instant::now();
         let readers = std::env::var("EVERYRUST_MFT_READERS").map_or(8, |value| value.parse().unwrap());
-        let (from_mft, report) = read_volume(|| std::fs::File::open(&image), readers, &mount).unwrap();
+        let block_bytes = std::env::var("EVERYRUST_MFT_BLOCK_KIB").map_or(DEFAULT_BLOCK_BYTES, |kib| kib.parse::<u64>().unwrap() << 10);
+        let (from_mft, report) = read_volume(|| std::fs::File::open(&image), readers, block_bytes, &mount).unwrap();
         eprintln!("{report}");
         let mft_time = started.elapsed();
         let started = std::time::Instant::now();
