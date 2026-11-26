@@ -21,10 +21,15 @@ use crate::timeutil;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
-/// Number of read errors encountered during the directory scan.
-#[derive(Debug, Default, Clone, Copy)]
+/// How a scan went.
+#[derive(Debug, Default, Clone)]
 pub struct ScanStats {
+    /// Number of read errors encountered during the directory walk.
     pub unreadable: usize,
+    /// Whether the entries came from the NTFS Master File Table.
+    pub used_mft: bool,
+    /// Why the MFT could not be read for a drive root, if it was tried.
+    pub mft_error: Option<String>,
 }
 
 /// Scans `root` recursively.
@@ -51,9 +56,17 @@ pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
         ));
     }
 
-    if let Some(entries) = scan_drive_root(root) {
-        return Ok((entries, ScanStats::default()));
-    }
+    let mft_error = match scan_drive_root(root) {
+        Some(Ok(entries)) => {
+            let stats = ScanStats {
+                used_mft: true,
+                ..ScanStats::default()
+            };
+            return Ok((entries, stats));
+        }
+        Some(Err(error)) => Some(format!("{error:#}")),
+        None => None,
+    };
 
     // Walk through an extended-length (`\\?\`) root so files deeper than
     // MAX_PATH are still reachable without a longPathAware manifest.
@@ -62,7 +75,9 @@ pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
     #[cfg(not(windows))]
     let directory = root.to_path_buf();
 
-    Ok(scan_directories(vec![directory]))
+    let (entries, mut stats) = scan_directories(vec![directory]);
+    stats.mft_error = mft_error;
+    Ok((entries, stats))
 }
 
 fn scan_directories(directories: Vec<PathBuf>) -> (Vec<Entry>, ScanStats) {
@@ -248,27 +263,28 @@ impl ScanBatch {
 }
 
 /// Reads a drive root through its MFT. `None` when the root is not a drive
-/// root or the MFT cannot be read; the caller then walks the directories.
+/// root or MFT reading is turned off, and an error when the MFT cannot be
+/// read; the caller then walks the directories.
 #[cfg(windows)]
-fn scan_drive_root(root: &Path) -> Option<Vec<Entry>> {
+fn scan_drive_root(root: &Path) -> Option<Result<Vec<Entry>>> {
     if std::env::var_os("EVERYRUST_NO_MFT").is_some() {
         return None;
     }
     let root = std::path::absolute(root).ok()?;
     crate::mft::drive_root_letter(&root)?;
-    match crate::mft::scan_volume_root(&root) {
-        Ok(entries) => Some(entries),
-        Err(error) => {
-            if std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some() {
-                eprintln!("MFT unavailable for {}: {error:#}", root.display());
-            }
-            None
+    let started = std::time::Instant::now();
+    let result = crate::mft::scan_volume_root(&root);
+    if std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some() {
+        match &result {
+            Ok(entries) => eprintln!("MFT read {} entries in {:?}", entries.len(), started.elapsed()),
+            Err(error) => eprintln!("MFT unavailable for {}: {error:#}", root.display()),
         }
     }
+    Some(result)
 }
 
 #[cfg(not(windows))]
-fn scan_drive_root(_root: &Path) -> Option<Vec<Entry>> {
+fn scan_drive_root(_root: &Path) -> Option<Result<Vec<Entry>>> {
     None
 }
 
@@ -278,8 +294,8 @@ pub fn scan_local_drives() -> Result<(Vec<Entry>, ScanStats)> {
     let mut walk = Vec::new();
     for drive in local_fixed_drives() {
         match scan_drive_root(&drive) {
-            Some(mut drive_entries) => entries.append(&mut drive_entries),
-            None => walk.push(extended_path(&drive)),
+            Some(Ok(mut drive_entries)) => entries.append(&mut drive_entries),
+            _ => walk.push(extended_path(&drive)),
         }
     }
     let (mut walked, stats) = scan_directories(walk);

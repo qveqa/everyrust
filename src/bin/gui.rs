@@ -116,7 +116,13 @@ struct App {
     selected: Option<usize>,
     search_time: Option<Duration>,
     scanning: bool,
-    receiver: Option<Receiver<Result<IndexedScan, String>>>,
+    receiver: Option<Receiver<ScanMessage>>,
+    /// Whether the index on screen comes from the saved index file.
+    showing_saved: bool,
+    /// How the last scan went, for the status bar.
+    scan_note: Option<String>,
+    /// Why the MFT could not be read, shown as a tooltip.
+    mft_error: Option<String>,
     status_error: Option<String>,
     unreadable: usize,
     elevated: bool,
@@ -131,9 +137,24 @@ struct App {
     icons: IconCache,
 }
 
+enum ScanMessage {
+    /// The saved index, shown while the fresh scan runs.
+    Saved(IndexedScan),
+    Done(Result<IndexedScan, String>),
+}
+
+/// What a source loader reports besides the entries.
+#[derive(Default)]
+struct LoadInfo {
+    unreadable: usize,
+    method: &'static str,
+    mft_error: Option<String>,
+}
+
 struct IndexedScan {
     index: SearchIndex,
-    unreadable: usize,
+    info: LoadInfo,
+    took: Duration,
     order: Vec<usize>,
     sort: (SortKey, bool),
     path_order: Vec<usize>,
@@ -167,6 +188,9 @@ impl App {
             search_time: None,
             scanning: false,
             receiver: None,
+            showing_saved: false,
+            scan_note: None,
+            mft_error: None,
             status_error: None,
             unreadable: 0,
             elevated: is_elevated(),
@@ -197,8 +221,16 @@ impl App {
         let root = std::path::absolute(&root).unwrap_or(root);
         self.last_scan_source = Some(root.clone());
         let roots = vec![root.clone()];
-        self.start_indexing(ctx, roots, move || {
-            scan::scan_with_stats(&root).map(|(entries, stats)| (entries, stats.unreadable))
+        let saved = saved_index_file(&root).map(|file| (file, root.clone()));
+        self.start_indexing(ctx, roots, saved, move || {
+            scan::scan_with_stats(&root).map(|(entries, stats)| {
+                let info = LoadInfo {
+                    unreadable: stats.unreadable,
+                    method: if stats.used_mft { "MFT" } else { "folder walk" },
+                    mft_error: stats.mft_error,
+                };
+                (entries, info)
+            })
         });
     }
 
@@ -212,16 +244,26 @@ impl App {
 
     fn start_load_file_list(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.last_scan_source = Some(path.clone());
-        self.start_indexing(ctx, Vec::new(), move || {
-            efu::read_file_list(&path).map(|entries| (entries, 0))
+        self.start_indexing(ctx, Vec::new(), None, move || {
+            efu::read_file_list(&path).map(|entries| {
+                let info = LoadInfo {
+                    method: "file list",
+                    ..LoadInfo::default()
+                };
+                (entries, info)
+            })
         });
     }
 
+    /// Loads a source on a background thread. With `saved` (the index file
+    /// and its root), the saved index is shown first when nothing is on screen
+    /// yet, and the fresh index is saved when the scan finishes.
     fn start_indexing(
         &mut self,
         ctx: &egui::Context,
         roots: Vec<PathBuf>,
-        load: impl FnOnce() -> anyhow::Result<(Vec<Entry>, usize)> + Send + 'static,
+        saved: Option<(PathBuf, PathBuf)>,
+        load: impl FnOnce() -> anyhow::Result<(Vec<Entry>, LoadInfo)> + Send + 'static,
     ) {
         self.watch = None;
         self.deleted_files.clear();
@@ -230,40 +272,46 @@ impl App {
         self.status_error = None;
         self.unreadable = 0;
         self.selected = None;
+        let show_saved = self.index.is_none();
         let sort = (self.sort, self.descending);
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
+            let started = Instant::now();
+            if let Some((file, root)) = saved.as_ref().filter(|_| show_saved) {
+                if let Ok(entries) = everyrust::cache::load(file, root) {
+                    let info = LoadInfo {
+                        method: "saved index",
+                        ..LoadInfo::default()
+                    };
+                    let scan = build_scan(entries, info, sort, None, None, started.elapsed());
+                    if sender.send(ScanMessage::Saved(scan)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            }
             let (watch, warning) = if roots.is_empty() {
                 (None, None)
             } else {
                 live::Watch::start(&roots, ctx.clone())
             };
+            let started = Instant::now();
+            let mut bytes = None;
             let result = load()
-                .map(|(entries, unreadable)| {
-                    let index = SearchIndex::new(entries, true);
-                    let mut order: Vec<usize> = (0..index.len()).collect();
-                    search::sort_hits(&index, &mut order, sort.0, sort.1);
-                    let path_order = if watch.is_some() {
-                        let mut paths: Vec<usize> = (0..index.len()).collect();
-                        search::sort_hits(&index, &mut paths, SortKey::Path, false);
-                        paths
-                    } else {
-                        Vec::new()
-                    };
-                    IndexedScan {
-                        index,
-                        unreadable,
-                        order,
-                        sort,
-                        path_order,
-                        watch,
-                        warning,
+                .map(|(entries, info)| {
+                    if let Some((_, root)) = &saved {
+                        bytes = Some(everyrust::cache::encode(root, &entries));
                     }
+                    build_scan(entries, info, sort, watch, warning, started.elapsed())
                 })
                 .map_err(|error| format!("{error:#}"));
-            if sender.send(result).is_ok() {
+            if sender.send(ScanMessage::Done(result)).is_ok() {
                 ctx.request_repaint();
+            }
+            if let (Some((file, _)), Some(bytes)) = (&saved, bytes) {
+                // The index works without the file; it only speeds up the next start.
+                let _ = everyrust::cache::save(file, &bytes);
             }
         });
         self.receiver = Some(receiver);
@@ -274,34 +322,57 @@ impl App {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(scan)) => {
-                self.hits.clear();
-                self.selected = None;
-                self.date_labels.clear();
-                // Freeing millions of entries takes a while; keep the UI responsive.
-                if let Some(previous) = self.index.replace(scan.index) {
-                    std::thread::spawn(move || drop(previous));
-                }
-                self.result_order = scan.order;
-                self.path_order = scan.path_order;
-                self.watch = scan.watch;
-                self.live_warning = scan.warning;
-                self.order_sort = scan.sort;
-                self.unreadable = scan.unreadable;
-                self.receiver = None;
-                self.scanning = false;
-                self.recompute();
+            Ok(ScanMessage::Saved(scan)) => {
+                self.show_scan(scan);
+                self.showing_saved = true;
             }
-            Ok(Err(error)) => {
+            Ok(ScanMessage::Done(Ok(scan))) => {
+                self.show_scan(scan);
+                self.showing_saved = false;
                 self.receiver = None;
                 self.scanning = false;
+            }
+            Ok(ScanMessage::Done(Err(error))) => {
+                self.receiver = None;
+                self.scanning = false;
+                self.showing_saved = false;
                 self.status_error = Some(error);
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.receiver = None;
                 self.scanning = false;
+                self.showing_saved = false;
             }
+        }
+    }
+
+    fn show_scan(&mut self, scan: IndexedScan) {
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        self.hits.clear();
+        self.selected = None;
+        self.date_labels.clear();
+        // Freeing millions of entries takes a while; keep the UI responsive.
+        if let Some(previous) = self.index.replace(scan.index) {
+            std::thread::spawn(move || drop(previous));
+        }
+        self.result_order = scan.order;
+        self.path_order = scan.path_order;
+        self.watch = scan.watch;
+        self.live_warning = scan.warning;
+        self.order_sort = scan.sort;
+        self.unreadable = scan.info.unreadable;
+        self.scan_note = Some(format!(
+            "{} in {:.2} s ({})",
+            if scan.info.method == "saved index" { "loaded" } else { "indexed" },
+            scan.took.as_secs_f64(),
+            scan.info.method
+        ));
+        self.mft_error = scan.info.mft_error;
+        self.recompute();
+        // Keep the selection when the fresh index replaces the saved one.
+        if let (Some(path), Some(index)) = (selected_path, &self.index) {
+            self.selected = self.hits.iter().position(|&hit| index.entry(hit).path == path);
         }
     }
 
@@ -755,7 +826,13 @@ impl eframe::App for App {
                     }
                     if self.scanning {
                         ui.spinner();
-                        ui.weak("Scanning…");
+                        ui.weak(if self.showing_saved { "Updating…" } else { "Scanning…" });
+                    }
+                    if let Some(note) = &self.scan_note {
+                        let label = ui.weak(format!("· {note}"));
+                        if let Some(error) = &self.mft_error {
+                            label.on_hover_text(format!("MFT unavailable: {error}"));
+                        }
                     }
                     if let Some(entry) = self.selected_entry() {
                         if let Some(bytes) = entry.size.filter(|_| !entry.is_dir) {
@@ -1466,6 +1543,55 @@ fn local_datetime(filetime: u64) -> String {
         }
         None => String::new(),
     }
+}
+
+/// Builds the index and the initial orders for a loaded source.
+fn build_scan(
+    entries: Vec<Entry>,
+    info: LoadInfo,
+    sort: (SortKey, bool),
+    watch: Option<live::Watch>,
+    warning: Option<String>,
+    took: Duration,
+) -> IndexedScan {
+    let index = SearchIndex::new(entries, true);
+    let mut order: Vec<usize> = (0..index.len()).collect();
+    search::sort_hits(&index, &mut order, sort.0, sort.1);
+    let path_order = if watch.is_some() {
+        let mut paths: Vec<usize> = (0..index.len()).collect();
+        search::sort_hits(&index, &mut paths, SortKey::Path, false);
+        paths
+    } else {
+        Vec::new()
+    };
+    IndexedScan {
+        index,
+        info,
+        took,
+        order,
+        sort,
+        path_order,
+        watch,
+        warning,
+    }
+}
+
+/// Where the index of `root` is saved between runs, or `None` when saving
+/// is turned off with `EVERYRUST_NO_CACHE`.
+fn saved_index_file(root: &Path) -> Option<PathBuf> {
+    if std::env::var_os("EVERYRUST_NO_CACHE").is_some() {
+        return None;
+    }
+    let folder = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    // FNV-1a of the root path gives each source its own file.
+    let hash = root
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    Some(folder.join("EveryRust").join(format!("index-{hash:016x}.bin")))
 }
 
 fn search_field_has_selection(ctx: &egui::Context) -> bool {

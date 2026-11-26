@@ -25,6 +25,9 @@ const ROOT_RECORD: u64 = 5;
 const FIRST_USER_RECORD: u64 = 16;
 /// Bytes read per block. A multiple of every valid cluster and record size.
 const BLOCK_BYTES: u64 = 4 << 20;
+/// Alignment of read buffers. Raw volume reads bypass the file cache, so
+/// buffers must be aligned to the sector size; a page covers every disk.
+const BUFFER_ALIGN: usize = 4096;
 /// The low 48 bits of a file reference are the record number.
 const RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// Fixups protect every 512-byte stride of a record, whatever the sector size.
@@ -34,6 +37,7 @@ const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
+const ATTR_BITMAP: u32 = 0xB0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
 const RECORD_IN_USE: u16 = 0x1;
@@ -69,7 +73,46 @@ pub fn scan_volume_root(root: &Path) -> Result<Vec<Entry>> {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&device)
     };
-    read_volume(open, &display)
+    let readers = if incurs_seek_penalty(&device) { 1 } else { 8 };
+    read_volume(open, readers, &display)
+}
+
+/// Whether the disk under a volume is a hard disk. SSDs report no seek
+/// penalty. Unknown disks count as SSDs, which are the common case.
+#[cfg(windows)]
+fn incurs_seek_penalty(device: &str) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
+        IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // Querying the property needs no read access, so no extra privileges.
+    let Ok(volume) = std::fs::OpenOptions::new().access_mode(0).share_mode(0x7).open(device) else {
+        return false;
+    };
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut answer = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+    let mut returned = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            volume.as_raw_handle() as _,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&raw const query).cast(),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            (&raw mut answer).cast(),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    ok != 0 && returned as usize >= std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() && answer.IncursSeekPenalty
 }
 
 /// The drive letter of a root path such as `C:\` or `\\?\C:\`.
@@ -84,18 +127,23 @@ pub fn drive_root_letter(root: &Path) -> Option<char> {
 
 /// Reads every file and folder of an NTFS volume.
 ///
-/// `open` returns a new reader positioned anywhere on the raw volume. Worker
-/// threads open their own readers so blocks are read in parallel.
-/// `root` is the display path of the volume root, for example `C:\`. The root
-/// itself is not returned, as with [`crate::scan::scan`].
-pub fn read_volume<R, F>(open: F, root: &Path) -> Result<Vec<Entry>>
+/// `open` returns a new reader positioned anywhere on the raw volume.
+/// `root` is the display path of the volume root, for example `C:\\`. The
+/// root itself is not returned, as with [`crate::scan::scan`].
+///
+/// Raw volume reads do not use the file cache, so every scan reads the MFT
+/// from the disk. `readers` threads take blocks in disk order: use one on a
+/// hard disk, where parallel reads cause seeks, and several on an SSD, which
+/// is fastest with many reads in flight. Other threads parse the blocks
+/// already read. Blocks without records in use, according to the `$MFT`
+/// bitmap, are skipped.
+pub fn read_volume<R, F>(open: F, readers: usize, root: &Path) -> Result<Vec<Entry>>
 where
-    R: Read + Seek,
+    R: Read + Seek + Send,
     F: Fn() -> io::Result<R> + Sync,
 {
     let mut volume = open().context("cannot open the volume")?;
     let layout = Layout::load(&mut volume)?;
-    drop(volume);
 
     let record_size = layout.geometry.record_size;
     let read_end = layout
@@ -103,24 +151,100 @@ where
         .min(round_up(layout.data_size, layout.geometry.cluster_size));
     // Only records that are actually allocated can be read.
     let records = layout.data_size.min(read_end) / record_size;
-    let blocks = usize::try_from(read_end.div_ceil(BLOCK_BYTES)).context("the MFT is too large")?;
-
-    let records_per_block = BLOCK_BYTES / record_size;
     ensure!(records <= u64::from(u32::MAX), "the MFT has too many records");
-    let blocks = (0..blocks)
-        .into_par_iter()
-        .map_init(
-            || (open(), Vec::new()),
-            |(volume, buffer), block| -> Result<Block> {
-                let volume = volume
-                    .as_mut()
-                    .map_err(|error| anyhow::anyhow!("cannot open the volume: {error}"))?;
-                let start = block as u64 * BLOCK_BYTES;
-                let length = (read_end - start).min(BLOCK_BYTES) as usize;
-                buffer.resize(length, 0);
-                layout
-                    .read(volume, start, buffer)
-                    .with_context(|| format!("cannot read MFT block at offset {start}"))?;
+    let records_per_block = BLOCK_BYTES / record_size;
+    let block_count = usize::try_from(records.div_ceil(records_per_block)).context("the MFT is too large")?;
+    let in_use = |number: u64| {
+        layout.bitmap.as_ref().is_none_or(|bitmap| {
+            bitmap
+                .get((number / 8) as usize)
+                .is_none_or(|byte| byte & (1 << (number % 8)) != 0)
+        })
+    };
+    let wanted: Vec<usize> = (0..block_count)
+        .filter(|&block| {
+            let first = block as u64 * records_per_block;
+            let last = (first + records_per_block).min(records);
+            match &layout.bitmap {
+                Some(bitmap) if first % 8 == 0 => {
+                    let bytes = (first / 8) as usize..(last.div_ceil(8)) as usize;
+                    bitmap.get(bytes).is_none_or(|bytes| bytes.iter().any(|&byte| byte != 0))
+                }
+                _ => (first..last).any(in_use),
+            }
+        })
+        .collect();
+
+    let readers = readers.clamp(1, wanted.len().max(1));
+    if std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some() {
+        eprintln!(
+            "MFT: {} MiB, reading {} of {} blocks, bitmap {}, {readers} reader(s)",
+            read_end >> 20,
+            wanted.len(),
+            block_count,
+            if layout.bitmap.is_some() { "used" } else { "missing" },
+        );
+    }
+    let pool_size = (rayon::current_num_threads() + readers * 2).clamp(4, 32);
+    let (to_parse, parse_queue) = std::sync::mpsc::sync_channel::<(usize, AlignedBuffer)>(pool_size / 2);
+    let (recycle, recycled) = std::sync::mpsc::channel::<AlignedBuffer>();
+    let recycled = std::sync::Mutex::new(recycled);
+    let allocated = std::sync::atomic::AtomicUsize::new(0);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let layout = &layout;
+    let wanted = &wanted;
+    let mut first_volume = Some(volume);
+
+    let (parsed, read_results) = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..readers)
+            .map(|_| {
+                let volume = first_volume.take();
+                let to_parse = to_parse.clone();
+                let (recycled, allocated, next, failed, open) = (&recycled, &allocated, &next, &failed, &open);
+                scope.spawn(move || -> Result<()> {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut volume = match volume {
+                        Some(volume) => volume,
+                        None => open().context("cannot open the volume")?,
+                    };
+                    let result = (|| {
+                        loop {
+                            let Some(&block) = wanted.get(next.fetch_add(1, Relaxed)) else { return Ok(()) };
+                            if failed.load(Relaxed) {
+                                return Ok(());
+                            }
+                            let reused = recycled.lock().unwrap().try_recv().ok();
+                            let mut buffer = match reused {
+                                Some(buffer) => buffer,
+                                None if allocated.fetch_add(1, Relaxed) < pool_size => AlignedBuffer::default(),
+                                None => match recycled.lock().unwrap().recv() {
+                                    Ok(buffer) => buffer,
+                                    Err(_) => return Ok(()),
+                                },
+                            };
+                            let start = block as u64 * BLOCK_BYTES;
+                            buffer.resize(((read_end - start).min(BLOCK_BYTES)) as usize);
+                            layout
+                                .read(&mut volume, start, &mut buffer)
+                                .with_context(|| format!("cannot read MFT block at offset {start}"))?;
+                            if to_parse.send((block, buffer)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                    })();
+                    if result.is_err() {
+                        failed.store(true, Relaxed);
+                    }
+                    result
+                })
+            })
+            .collect();
+        drop(to_parse);
+        let parsed: Vec<(usize, Block)> = parse_queue
+            .into_iter()
+            .par_bridge()
+            .map(|(block, mut buffer)| {
                 let first = block as u64 * records_per_block;
                 let mut parsed = Block::default();
                 for (offset, record) in buffer.chunks_exact_mut(record_size as usize).enumerate() {
@@ -128,16 +252,72 @@ where
                     if number >= records {
                         break;
                     }
+                    if !in_use(number) {
+                        continue;
+                    }
                     if let Some(record) = parse_record(number, record, block as u32, &mut parsed.names) {
                         parsed.records.push(record);
                     }
                 }
-                Ok(parsed)
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+                let _ = recycle.send(buffer);
+                (block, parsed)
+            })
+            .collect();
+        drop(recycle);
+        let read_results: Vec<Result<()>> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect();
+        (parsed, read_results)
+    });
+    read_results.into_iter().collect::<Result<()>>()?;
 
+    let mut blocks: Vec<Block> = (0..block_count).map(|_| Block::default()).collect();
+    for (index, block) in parsed {
+        blocks[index] = block;
+    }
     build_entries(blocks, records, records_per_block, root)
+}
+
+/// A zeroed byte buffer whose start is aligned to [`BUFFER_ALIGN`].
+#[derive(Default)]
+struct AlignedBuffer {
+    pages: Vec<Page>,
+    length: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(4096))]
+struct Page([u8; BUFFER_ALIGN]);
+
+impl AlignedBuffer {
+    fn new(length: usize) -> Self {
+        let mut buffer = Self::default();
+        buffer.resize(length);
+        buffer
+    }
+
+    fn resize(&mut self, length: usize) {
+        self.pages.resize(length.div_ceil(BUFFER_ALIGN), Page([0; BUFFER_ALIGN]));
+        self.length = length;
+    }
+}
+
+impl std::ops::Deref for AlignedBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `Page` is plain bytes without padding, the pages are
+        // contiguous, and `length` never exceeds their total size.
+        unsafe { std::slice::from_raw_parts(self.pages.as_ptr().cast(), self.length) }
+    }
+}
+
+impl std::ops::DerefMut for AlignedBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `deref`, and the borrow is unique.
+        unsafe { std::slice::from_raw_parts_mut(self.pages.as_mut_ptr().cast(), self.length) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,18 +380,20 @@ struct Layout {
     geometry: Geometry,
     runs: Vec<Run>,
     data_size: u64,
+    /// One bit per MFT record that is in use; `None` when it cannot be read.
+    bitmap: Option<Vec<u8>>,
 }
 
 impl Layout {
     fn load<R: Read + Seek>(volume: &mut R) -> Result<Self> {
         // 4 KiB covers the boot sector on 512-byte and 4 KiB sector disks.
-        let mut boot = vec![0; 4096];
+        let mut boot = AlignedBuffer::new(4096);
         volume.seek(SeekFrom::Start(0))?;
         volume.read_exact(&mut boot).context("cannot read the boot sector")?;
         let geometry = parse_boot_sector(&boot)?;
 
         // Record 0 describes the MFT. Read it from the cluster in the boot sector.
-        let mut first = vec![0; round_up(geometry.record_size, geometry.cluster_size) as usize];
+        let mut first = AlignedBuffer::new(round_up(geometry.record_size, geometry.cluster_size) as usize);
         volume.seek(SeekFrom::Start(
             geometry
                 .mft_cluster
@@ -223,25 +405,49 @@ impl Layout {
         ensure!(apply_fixups(record), "the first MFT record is damaged");
 
         let mut segments = Vec::new();
-        collect_data_segments(record, &mut segments)?;
+        let mut bitmap_segments = Vec::new();
+        collect_segments(record, ATTR_DATA, &mut segments)?;
+        let mut bitmap = collect_bitmap(record, &mut bitmap_segments);
         let mut layout = Self::from_segments(geometry, &segments)?;
 
         // A fragmented MFT can keep more runs in extension records listed by
         // its $ATTRIBUTE_LIST.
         let extensions = layout.attribute_list_extensions(volume, record)?;
         for number in extensions {
-            let mut extension = vec![0; geometry.record_size as usize];
+            let mut extension = AlignedBuffer::new(geometry.record_size as usize);
             let offset = number
                 .checked_mul(geometry.record_size)
                 .context("invalid MFT extension record")?;
             layout.read(volume, offset, &mut extension)?;
             ensure!(apply_fixups(&mut extension), "MFT extension record {number} is damaged");
-            collect_data_segments(&extension, &mut segments)?;
+            collect_segments(&extension, ATTR_DATA, &mut segments)?;
+            bitmap = bitmap.or_else(|| collect_bitmap(&extension, &mut bitmap_segments));
         }
         if !segments.is_empty() {
             layout = Self::from_segments(geometry, &segments)?;
         }
+        // The bitmap only speeds up reading; without it every record is read.
+        layout.bitmap = bitmap.or_else(|| layout.read_bitmap(volume, &bitmap_segments).ok());
         Ok(layout)
+    }
+
+    /// Reads a non-resident `$MFT` bitmap from its segments.
+    fn read_bitmap<R: Read + Seek>(&self, volume: &mut R, segments: &[(u64, Vec<Run>, Option<u64>)]) -> Result<Vec<u8>> {
+        let size = segments
+            .iter()
+            .find_map(|(vcn, _, size)| (*vcn == 0).then_some(*size).flatten())
+            .context("no MFT bitmap")?;
+        let mut ordered: Vec<_> = segments.iter().collect();
+        ordered.sort_by_key(|(vcn, _, _)| *vcn);
+        ordered.dedup_by_key(|(vcn, _, _)| *vcn);
+        let runs: Vec<Run> = ordered.into_iter().flat_map(|(_, runs, _)| runs.iter().copied()).collect();
+        validate_runs(&runs, self.geometry.cluster_size)?;
+        let size = usize::try_from(size).context("MFT bitmap is too large")?;
+        ensure!(size <= 1 << 30, "MFT bitmap is too large");
+        // Raw volume reads must cover whole sectors, so read whole clusters.
+        let mut bytes = AlignedBuffer::new(round_up(size as u64, self.geometry.cluster_size) as usize);
+        read_runs(volume, &runs, self.geometry.cluster_size, 0, &mut bytes)?;
+        Ok(bytes[..size].to_vec())
     }
 
     fn from_segments(geometry: Geometry, segments: &[(u64, Vec<Run>, Option<u64>)]) -> Result<Self> {
@@ -262,6 +468,7 @@ impl Layout {
             geometry,
             runs,
             data_size,
+            bitmap: None,
         })
     }
 
@@ -271,7 +478,7 @@ impl Layout {
             .map_or(0, |run| (run.vcn + run.clusters) * self.geometry.cluster_size)
     }
 
-    /// Extension records that hold more of the MFT's own data runs.
+    /// Extension records that hold more of the MFT's own data runs or bitmap.
     fn attribute_list_extensions<R: Read + Seek>(&self, volume: &mut R, record: &[u8]) -> Result<Vec<u64>> {
         let Some(list) = attributes(record).find(|attribute| attribute.kind == ATTR_ATTRIBUTE_LIST) else {
             return Ok(Vec::new());
@@ -284,10 +491,9 @@ impl Layout {
             ensure!(size <= 16 << 20, "MFT attribute list is too large");
             validate_runs(&header.runs, self.geometry.cluster_size)?;
             // Raw volume reads must cover whole sectors, so read whole clusters.
-            let mut bytes = vec![0; round_up(size as u64, self.geometry.cluster_size) as usize];
+            let mut bytes = AlignedBuffer::new(round_up(size as u64, self.geometry.cluster_size) as usize);
             read_runs(volume, &header.runs, self.geometry.cluster_size, 0, &mut bytes)?;
-            bytes.truncate(size);
-            bytes
+            bytes[..size].to_vec()
         };
         let mut numbers = Vec::new();
         let mut offset = 0;
@@ -298,7 +504,11 @@ impl Layout {
             }
             let name_length = bytes.get(offset + 6).copied().unwrap_or(0);
             let number = le_u64(&bytes, offset + 0x10).unwrap_or(0) & RECORD_MASK;
-            if kind == ATTR_DATA && name_length == 0 && number != 0 && !numbers.contains(&number) {
+            if matches!(kind, ATTR_DATA | ATTR_BITMAP)
+                && name_length == 0
+                && number != 0
+                && !numbers.contains(&number)
+            {
                 numbers.push(number);
             }
             offset += length;
@@ -358,17 +568,30 @@ fn read_runs<R: Read + Seek>(
     Ok(())
 }
 
-/// Adds the unnamed $DATA segments of an MFT record: (first VCN, runs, size).
-fn collect_data_segments(record: &[u8], segments: &mut Vec<(u64, Vec<Run>, Option<u64>)>) -> Result<()> {
+/// Adds the non-resident segments of the unnamed attribute `kind` of an MFT
+/// record: (first VCN, runs, size).
+fn collect_segments(record: &[u8], kind: u32, segments: &mut Vec<(u64, Vec<Run>, Option<u64>)>) -> Result<()> {
     for attribute in attributes(record) {
-        if attribute.kind != ATTR_DATA || attribute.name_length != 0 {
+        if attribute.kind != kind || attribute.name_length != 0 {
             continue;
         }
-        let header = attribute.non_resident().context("damaged MFT data attribute")?;
+        let header = attribute.non_resident().context("damaged MFT attribute")?;
         let size = (header.first_vcn == 0).then_some(header.data_size);
         segments.push((header.first_vcn, header.runs, size));
     }
     Ok(())
+}
+
+/// Returns a resident `$MFT` bitmap, or adds the segments of a non-resident one.
+fn collect_bitmap(record: &[u8], segments: &mut Vec<(u64, Vec<Run>, Option<u64>)>) -> Option<Vec<u8>> {
+    let attribute = attributes(record).find(|attribute| attribute.kind == ATTR_BITMAP && attribute.name_length == 0)?;
+    if let Some(value) = attribute.resident_value() {
+        return Some(value.to_vec());
+    }
+    let header = attribute.non_resident()?;
+    let size = (header.first_vcn == 0).then_some(header.data_size);
+    segments.push((header.first_vcn, header.runs, size));
+    None
 }
 
 /// Undoes the update sequence fixups of a record. False for a damaged or unused record.
@@ -1035,7 +1258,8 @@ mod tests {
         let image = PathBuf::from(std::env::var_os("EVERYRUST_NTFS_IMAGE").unwrap());
         let mount = PathBuf::from(std::env::var_os("EVERYRUST_NTFS_MOUNT").unwrap());
         let started = std::time::Instant::now();
-        let from_mft = read_volume(|| std::fs::File::open(&image), &mount).unwrap();
+        let readers = std::env::var("EVERYRUST_MFT_READERS").map_or(8, |value| value.parse().unwrap());
+        let from_mft = read_volume(|| std::fs::File::open(&image), readers, &mount).unwrap();
         let mft_time = started.elapsed();
         let started = std::time::Instant::now();
         let from_walk = crate::scan::scan(&mount).unwrap();

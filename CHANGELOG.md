@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Русский
+
+- После сканирования индекс сохраняется в `%LOCALAPPDATA%\EveryRust`. При следующем запуске окно показывает сохранённый индекс сразу (1,5 млн записей загружаются примерно за 0,1 с), а свежий индекс заменяет его в фоне. `EVERYRUST_NO_CACHE` отключает сохранение.
+- Строка состояния показывает способ индексации и время, например `indexed in 0.42 s (MFT)`. Если MFT прочитать не удалось, подсказка показывает причину.
+- Чтение MFT пропускает блоки без используемых записей по битовой карте `$MFT`.
+- На жёстком диске MFT читается одним потоком по порядку, на SSD — восемью потоками. Тип диска определяется через `IOCTL_STORAGE_QUERY_PROPERTY`.
+- Буферы для прямого чтения тома выровнены по 4 КиБ, как требует Windows для чтения без кэша. Том открывается один раз на поток чтения, а не на каждый блок.
+- `EVERYRUST_DEBUG_SCAN` выводит размер MFT, число прочитанных блоков и время.
+
+### English
+
+- After a scan, the index is saved to `%LOCALAPPDATA%\EveryRust`. On the next start, the window shows the saved index at once (1.5 million entries load in about 0.1 s), and the fresh index replaces it in the background. `EVERYRUST_NO_CACHE` turns off saving.
+- The status bar shows how the index was built and how long it took, for example `indexed in 0.42 s (MFT)`. When the MFT cannot be read, a tooltip shows why.
+- MFT reading skips blocks without records in use, according to the `$MFT` bitmap.
+- On a hard disk, the MFT is read by one thread in disk order; on an SSD, by eight threads. The disk type comes from `IOCTL_STORAGE_QUERY_PROPERTY`.
+- Buffers for raw volume reads are aligned to 4 KiB, as Windows requires for uncached reads. Each reader thread opens the volume once instead of once per block.
+- `EVERYRUST_DEBUG_SCAN` prints the MFT size, the number of blocks read, and the time.
+
 ## 0.2.6
 
 ### Русский

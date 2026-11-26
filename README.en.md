@@ -122,6 +122,19 @@ to turn off MFT reading. An MFT index also contains the files inside folders
 that are reparse points, such as OneDrive cloud folders; the directory walk
 does not enter those folders.
 
+The status bar shows how the index was built and how long it took, for
+example `indexed in 0.42 s (MFT)`. When the MFT cannot be read, the tooltip of
+this text shows why.
+
+After each scan, the index is saved to `%LOCALAPPDATA%\EveryRust`. On the
+next start, the window shows the saved index at once with `Updating…`, and the
+fresh index replaces it when the scan finishes. Set `EVERYRUST_NO_CACHE` to
+turn off saving. The saved file holds the names of all files on the drive,
+including folders that a standard user cannot open.
+
+Set environment variables in a console that runs as administrator. When the
+app restarts itself through UAC, the new process does not get them.
+
 Reparse points such as junctions appear in the results, and recursive scans
 skip their targets. With a directory walk, index coverage depends on directory
 access permissions.
