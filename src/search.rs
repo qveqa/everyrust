@@ -214,7 +214,7 @@ pub fn sort_hits(index: &SearchIndex, hits: &mut [usize], sort: SortKey, descend
         None => a.cmp(&b),
     };
     if sort == SortKey::Path {
-        hits.par_sort_unstable_by(|&a, &b| direct(path_order(a, b)));
+        hits.par_sort_unstable_by(|&a, &b| direct(path_order(a, b)).then_with(|| a.cmp(&b)));
         return;
     }
     let mut keyed: Vec<(u128, usize)> = hits
@@ -227,7 +227,7 @@ pub fn sort_hits(index: &SearchIndex, hits: &mut [usize], sort: SortKey, descend
                 SortKey::Name => index.name_lower(a).cmp(index.name_lower(b)),
                 _ => Ordering::Equal,
             };
-            direct(tie.then_with(|| path_order(a, b)))
+            direct(tie.then_with(|| path_order(a, b))).then_with(|| a.cmp(&b))
         })
     });
     hits.par_iter_mut()

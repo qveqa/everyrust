@@ -209,6 +209,7 @@ fn resolve(paths: HashMap<PathBuf, bool>) -> HashMap<PathBuf, Option<Entry>> {
 /// Applies resolved path changes from file system notifications.
 pub fn apply_paths(index: &mut SearchIndex, changes: HashMap<PathBuf, Option<Entry>>) -> Applied {
     let mut applied = Applied::default();
+    index.start_batch();
     let mut changes: Vec<(PathBuf, Option<Entry>)> = changes.into_iter().collect();
     // Removals first, then parents before their children.
     changes.sort_by_key(|(path, entry)| (entry.is_some(), path.components().count()));
@@ -232,6 +233,7 @@ pub fn apply_paths(index: &mut SearchIndex, changes: HashMap<PathBuf, Option<Ent
             },
         }
     }
+    applied.removed.extend(index.finish_batch());
     applied.updated.retain(|&id| index.is_live(id));
     applied
 }

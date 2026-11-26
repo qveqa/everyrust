@@ -106,7 +106,10 @@ the GUI executable in the destination folder.
 |---|---|
 | [`src/scan.rs`](src/scan.rs) | Parallel directory scanning and metadata collection |
 | [`src/mft.rs`](src/mft.rs) | Reading the NTFS Master File Table (MFT) |
-| [`src/search.rs`](src/search.rs) | In-memory index, query parsing, filtering, and sorting |
+| [`src/index.rs`](src/index.rs) | Compact index: a tree of names with metadata |
+| [`src/usn.rs`](src/usn.rs) | NTFS change journal (USN) and applying changes to the index |
+| [`src/cache.rs`](src/cache.rs) | Saving the index between runs |
+| [`src/search.rs`](src/search.rs) | Query parsing, filtering, and sorting |
 | [`src/efu.rs`](src/efu.rs) | Reading and writing file lists |
 | [`src/bin/gui.rs`](src/bin/gui.rs) | Main window, virtualized results table, and file actions |
 | [`src/bin/gui/live.rs`](src/bin/gui/live.rs) | File monitoring and batched index updates |
@@ -122,19 +125,24 @@ to turn off MFT reading. An MFT index also contains the files inside folders
 that are reparse points, such as OneDrive cloud folders; the directory walk
 does not enter those folders.
 
-The status bar shows how the index was built and how long it took, for
-example `indexed in 2.05 s (MFT)`. The tooltip of this text shows where the
-MFT read time went, or why the MFT could not be read.
+The index is a tree, as in Everything: each entry keeps only its name, a link
+to its folder, and its metadata, and all names share one buffer. Full paths
+are built when needed. For 878,000 files the index takes about 90 MB; in
+version 0.2.7 it took about 470 MB.
 
 The disk limits how fast the MFT can be read. On the test PC with an NVMe SSD
 (878,000 files, an 840 MiB MFT), reading took about 2 s at 460 MiB/s. The
 directory walk took 1.1 s with a warm Windows cache and 2.3 s without it. The
 window shows the saved index at once in both cases.
 
-After each scan, the index is saved to `%LOCALAPPDATA%\EveryRust`. On the
-next start, the window shows the saved index at once with `Updating…`, and the
-fresh index replaces it when the scan finishes. Set `EVERYRUST_NO_CACHE` to
-turn off saving. The saved file holds the names of all files on the drive,
+After a scan and when the window closes, the index is saved to
+`%LOCALAPPDATA%\EveryRust`. For a drive read through the MFT, the position in
+the NTFS change journal (USN) is saved with it. On the next start, the app
+loads the index and applies only the changes from the journal, without
+reading the MFT again. While the app runs, it reads the journal every half
+second. When the journal is not available or was cleared, the app shows the
+saved index with `Updating…` and scans the drive again. Set
+`EVERYRUST_NO_CACHE` to turn off saving. The saved file holds the names of all files on the drive,
 including folders that a standard user cannot open.
 
 Set environment variables in a console that runs as administrator. When the

@@ -218,6 +218,7 @@ impl App {
         self.saved_file = saved_index_file(&root).map(|file| (file, root.clone()));
         let saved_file = self.saved_file.clone();
         let show_saved = self.index.is_none();
+        let elevated = self.elevated;
         self.start_indexing(move |sort, ctx, sender| {
             let mut saved = None;
             if let Some((file, root)) = saved_file.as_ref().filter(|_| show_saved) {
@@ -239,7 +240,9 @@ impl App {
             }
             // Watch folders from the start, so no change during the walk is lost.
             // Drives read from the MFT use the change journal instead.
-            let drive = everyrust::mft::drive_root_letter(&root).filter(|_| cfg!(windows));
+            // Without administrator rights the MFT cannot be read; then the
+            // walk needs notifications from the start too.
+            let drive = everyrust::mft::drive_root_letter(&root).filter(|_| cfg!(windows) && elevated);
             let (mut watch, mut warning) = match drive {
                 Some(_) => (None, None),
                 None => live::Watch::start(std::slice::from_ref(&root), ctx.clone()),
@@ -343,6 +346,10 @@ impl App {
 
     fn show_scan(&mut self, scan: IndexedScan) {
         let selected_path = self.selected_entry().map(|entry| entry.path);
+        let selected_record = self
+            .selected
+            .and_then(|row| self.hits.get(row))
+            .and_then(|&id| self.index.as_ref()?.record(id));
         self.hits.clear();
         self.selected = None;
         self.date_labels.clear();
@@ -359,8 +366,14 @@ impl App {
         self.dirty = scan.dirty;
         self.recompute();
         // Keep the selection when the fresh index replaces the saved one.
+        // MFT indexes find it by record, which needs no path lookup table.
         if let (Some(path), Some(index)) = (selected_path, self.index.as_mut()) {
-            if let Some(id) = index.find(&path) {
+            let id = match selected_record {
+                Some(record) => index.nodes_of_record(record).into_iter().find(|&id| index.path(id) == path),
+                None if !index.has_records() => index.find(&path),
+                None => None,
+            };
+            if let Some(id) = id {
                 self.selected = self.hits.iter().position(|&hit| hit == id);
             }
         }
@@ -421,9 +434,27 @@ impl App {
         }
         self.dirty = true;
         let selected_id = self.selected.and_then(|row| self.hits.get(row)).copied();
-        let Some(index) = self.index.as_ref() else {
+        let Some(index) = self.index.as_mut() else {
             return;
         };
+        // Removed slots and old names add up in a long session; rebuild the
+        // index without them once they outweigh the live files.
+        if index.dead_len() > 50_000 && index.dead_len() > index.live_len() {
+            let nodes = index.compact();
+            let selected_path = selected_id.map(|id| index.path(id));
+            *index = SearchIndex::from_nodes(nodes, true);
+            self.result_order = index.ids();
+            search::sort_hits(index, &mut self.result_order, self.order_sort.0, self.order_sort.1);
+            self.hits.clear();
+            self.selected = None;
+            self.recompute();
+            if let (Some(path), Some(index)) = (selected_path, self.index.as_mut()) {
+                if let Some(id) = (!index.has_records()).then(|| index.find(&path)).flatten() {
+                    self.selected = self.hits.iter().position(|&hit| hit == id);
+                }
+            }
+            return;
+        }
         live::update_order(index, &mut self.result_order, self.order_sort, &applied);
         self.selected = None;
         self.hits.clear();
@@ -616,8 +647,12 @@ impl App {
         if self.watch.as_ref().is_some_and(|watch| !watch.is_journal()) {
             self.deleted_files.insert(path.clone());
         }
-        if let Some(index) = self.index.as_mut() {
-            let applied = live::apply_paths(index, HashMap::from([(path, None)]));
+        let selected_id = self.selected.and_then(|row| self.hits.get(row)).copied();
+        if let (Some(index), Some(id)) = (self.index.as_mut(), selected_id) {
+            let applied = everyrust::usn::Applied {
+                removed: index.remove(&[id]),
+                ..Default::default()
+            };
             self.apply_changes(applied);
         }
     }

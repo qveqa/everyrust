@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Русский
+
+- Индекс хранится как дерево имён, как в Everything: вместо полного пути у каждой записи есть имя, ссылка на папку и метаданные в общих массивах. На 878 тыс. файлов индекс занимает около 90 МБ вместо 470 МБ.
+- MFT сразу строит дерево, без промежуточных полных путей.
+- Журнал изменений NTFS (USN): после первого чтения MFT приложение сохраняет позицию в журнале. При следующем запуске оно применяет только изменения с прошлого раза, без повторного чтения MFT. Во время работы изменения тоже приходят из журнала, поэтому массовые изменения файлов больше не вызывают полного пересканирования.
+- Индекс сохраняется и при закрытии окна. Формат файла индекса изменился; старый файл будет создан заново.
+- Из строки состояния убраны время индексации, способ и подсказка с подробностями.
+
+### English
+
+- The index is a tree of names, as in Everything: instead of a full path, each entry has a name, a link to its folder, and metadata in shared arrays. For 878,000 files the index takes about 90 MB instead of 470 MB.
+- The MFT reader builds the tree directly, without full paths in between.
+- NTFS change journal (USN): after the first MFT read, the app saves its position in the journal. On the next start, it applies only the changes since the last run, without reading the MFT again. While the app runs, changes also come from the journal, so mass file changes no longer cause a full rescan.
+- The index is also saved when the window closes. The index file format changed; the old file is created again.
+- The status bar no longer shows the indexing time, the method, or the tooltip with details.
+
 ## 0.2.7
 
 ### Русский

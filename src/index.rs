@@ -306,6 +306,10 @@ pub struct SearchIndex {
     /// (parent, name hash) to node, built on the first path lookup.
     children: Option<HashMap<(u32, u64), u32>>,
     dead: usize,
+    /// Whether a batch of changes is running (see [`Self::start_batch`]).
+    batch: bool,
+    /// Whether nodes below removed folders still need removing.
+    sweep_needed: bool,
     /// Whether ids no longer follow the path order.
     mutated: bool,
     ranks: OnceLock<Vec<u32>>,
@@ -371,6 +375,8 @@ impl SearchIndex {
             root_record: None,
             children: None,
             dead,
+            batch: false,
+            sweep_needed: false,
             mutated: !path_sorted,
             ranks: OnceLock::new(),
         };
@@ -523,6 +529,11 @@ impl SearchIndex {
         let mut current = id as u32;
         loop {
             chain.push(current);
+            // Changes in a batch can leave a loop for a moment; never hang on it.
+            if chain.len() > self.len() {
+                chain.reverse();
+                return 0;
+            }
             match Parent::decode(self.nodes.parent[current as usize]) {
                 Parent::Root(root) => {
                     chain.reverse();
@@ -797,7 +808,26 @@ impl SearchIndex {
         true
     }
 
-    /// Removes nodes and everything below them. Returns all removed ids.
+    /// Starts a batch of changes: removing a folder no longer removes the
+    /// nodes below it at once, which costs a pass over the whole index.
+    /// [`Self::finish_batch`] does that once for the whole batch.
+    pub fn start_batch(&mut self) {
+        self.batch = true;
+    }
+
+    /// Ends a batch and removes the nodes below removed folders. Returns them.
+    pub fn finish_batch(&mut self) -> Vec<usize> {
+        self.batch = false;
+        if std::mem::take(&mut self.sweep_needed) {
+            self.remove_orphans()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Removes nodes and everything below them. Returns all removed ids;
+    /// inside a batch, nodes below removed folders come from
+    /// [`Self::finish_batch`] instead.
     pub fn remove(&mut self, ids: &[usize]) -> Vec<usize> {
         let mut removed = Vec::new();
         let mut folders = false;
@@ -809,9 +839,44 @@ impl SearchIndex {
             }
         }
         if folders {
-            removed.extend(self.remove_orphans());
+            removed.extend(self.sweep());
         }
         removed
+    }
+
+    fn sweep(&mut self) -> Vec<usize> {
+        if self.batch {
+            self.sweep_needed = true;
+            Vec::new()
+        } else {
+            self.remove_orphans()
+        }
+    }
+
+    /// Whether `parent` is the folder `folder` or lies inside it.
+    pub fn is_inside(&self, parent: Parent, folder: usize) -> bool {
+        let mut current = parent;
+        for _ in 0..=self.len() {
+            match current {
+                Parent::Root(_) => return false,
+                Parent::Node(node) if node as usize == folder => return true,
+                Parent::Node(node) => current = self.parent(node as usize),
+            }
+        }
+        true
+    }
+
+    /// The full path of a folder or root path.
+    pub fn parent_path(&self, parent: Parent) -> PathBuf {
+        match parent {
+            Parent::Root(root) => PathBuf::from(&self.nodes.roots[root as usize]),
+            Parent::Node(node) => self.path(node as usize),
+        }
+    }
+
+    /// Number of removed slots.
+    pub fn dead_len(&self) -> usize {
+        self.dead
     }
 
     /// Removes the node at `path`, everything below it, and every root path
@@ -829,7 +894,7 @@ impl SearchIndex {
             }
         }
         if roots {
-            removed.extend(self.remove_orphans());
+            removed.extend(self.sweep());
         }
         removed
     }
@@ -852,6 +917,7 @@ impl SearchIndex {
         const UNKNOWN: u8 = 0;
         const GONE: u8 = 1;
         const ALIVE: u8 = 2;
+        const VISITING: u8 = 3;
         let mut state: Vec<u8> = self.nodes.flags.iter().map(|&flags| if flags & DEAD != 0 { GONE } else { UNKNOWN }).collect();
         let mut chain = Vec::new();
         let mut removed = Vec::new();
@@ -863,14 +929,17 @@ impl SearchIndex {
             let mut current = id;
             let result = loop {
                 chain.push(current);
+                state[current] = VISITING;
                 match Parent::decode(self.nodes.parent[current]) {
                     Parent::Root(root) => break if self.dead_roots[root as usize] { GONE } else { ALIVE },
                     Parent::Node(parent) => {
                         let parent = parent as usize;
-                        if state[parent] != UNKNOWN {
-                            break state[parent];
+                        match state[parent] {
+                            UNKNOWN => current = parent,
+                            // A loop is not reachable from any root.
+                            VISITING => break GONE,
+                            known => break known,
                         }
-                        current = parent;
                     }
                 }
             };
@@ -1078,7 +1147,7 @@ impl Nodes {
         }
         ensure!(at as usize == nodes.names.len(), "damaged index");
         // Record numbers size a lookup table; keep them near the node count.
-        let limit = (count as u64 * 64 + (1 << 20)).min(u64::from(NONE)) as u32;
+        let limit = 1 << 25;
         ensure!(
             nodes.records.iter().all(|&record| record == NONE || record < limit)
                 && nodes.root_record.is_none_or(|(record, _)| record < limit),

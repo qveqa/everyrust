@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::index::{Meta, SearchIndex};
+use crate::index::{Meta, Parent, SearchIndex};
 
 pub const REASON_FILE_DELETE: u32 = 0x200;
 pub const REASON_RENAME_OLD_NAME: u32 = 0x1000;
@@ -149,6 +149,7 @@ impl Applied {
 /// path is on the disk; it decides which hard links of a file still exist.
 pub fn apply(index: &mut SearchIndex, changes: Vec<Change>, exists: impl Fn(&Path) -> bool) -> Applied {
     let mut applied = Applied::default();
+    index.start_batch();
     let mut pending = changes;
     // A file can appear before the folder it moved into; retry those.
     loop {
@@ -172,6 +173,7 @@ pub fn apply(index: &mut SearchIndex, changes: Vec<Change>, exists: impl Fn(&Pat
         }
         pending = deferred;
     }
+    applied.removed.extend(index.finish_batch());
     applied.updated.sort_unstable();
     applied.updated.dedup();
     applied.updated.retain(|&id| index.is_live(id));
@@ -183,6 +185,11 @@ pub fn apply(index: &mut SearchIndex, changes: Vec<Change>, exists: impl Fn(&Pat
 /// Applies one change. False when its folder is not in the index yet.
 fn apply_one(index: &mut SearchIndex, change: &Change, exists: &impl Fn(&Path) -> bool, applied: &mut Applied) -> bool {
     let record = record_of(change.frn);
+    // Changes to the volume root itself (its attributes, for example) do not
+    // add a node.
+    if index.folder_of_record(record).is_some_and(|parent| matches!(parent, Parent::Root(_))) {
+        return true;
+    }
     let existing = index.nodes_of_record(record);
     let (meta, links) = match &change.state {
         State::Gone => {
@@ -203,21 +210,23 @@ fn apply_one(index: &mut SearchIndex, change: &Change, exists: &impl Fn(&Path) -
     });
     let name = change.name.as_os_str();
 
-    if links > 1 && !is_dir {
-        // Hard links: keep the names that still exist and add the new one.
+    if !is_dir && (links > 1 || existing.len() > 1) {
+        // Hard links. A record can name a link that was just removed, so
+        // keep only the names that are still on the disk. A journal run
+        // names one link per file; a second link added in the same run
+        // appears with the next rescan.
         let mut have_name = false;
         for &id in &existing {
-            if index.parent(id) == parent && index.name_os(id) == name {
-                have_name = true;
-            } else if !exists(&index.path(id)) {
+            if !exists(&index.path(id)) {
                 applied.removed.extend(index.remove(&[id]));
                 continue;
             }
+            have_name |= index.parent(id) == parent && index.name_os(id) == name;
             if meta.is_some() && index.set_meta(id, new_meta) {
                 applied.updated.push(id);
             }
         }
-        if !have_name {
+        if !have_name && exists(&index.parent_path(parent).join(name)) {
             applied.updated.push(index.insert(parent, name, new_meta, Some(record)));
         }
         return true;
@@ -225,6 +234,11 @@ fn apply_one(index: &mut SearchIndex, change: &Change, exists: &impl Fn(&Path) -
 
     match existing.split_first() {
         Some((&id, extra)) if index.is_dir(id) == is_dir => {
+            // Moving a folder into a folder that is still inside it would
+            // make a loop; a later change moves that folder out first.
+            if is_dir && index.is_inside(parent, id) {
+                return false;
+            }
             if index.rename(id, parent, name) {
                 applied.updated.push(id);
                 applied.folders_moved |= is_dir;
@@ -460,7 +474,7 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{Nodes, Parent};
+    use crate::index::Nodes;
 
     fn record(frn: u64, parent_frn: u64, reason: u32, name: &str) -> Vec<u8> {
         let wide: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -551,6 +565,68 @@ mod tests {
         );
         let x = index.nodes_of_record(21)[0];
         assert_eq!(index.size(x), Some(5));
+    }
+
+    fn volume(build: impl FnOnce(&mut Nodes, u32)) -> SearchIndex {
+        let mut nodes = Nodes::default();
+        let root = nodes.add_root("/v");
+        nodes.set_root_record(5, root);
+        build(&mut nodes, root);
+        SearchIndex::from_nodes(nodes, true)
+    }
+
+    fn listing(index: &SearchIndex) -> Vec<std::path::PathBuf> {
+        let mut paths: Vec<_> = index.ids().iter().map(|&id| index.path(id)).collect();
+        paths.sort();
+        paths
+    }
+
+    fn change(frn: u64, parent_frn: u64, name: &str, state: State) -> Change {
+        Change { frn, parent_frn, name: name.into(), attributes: 0, state }
+    }
+
+    #[test]
+    fn crossing_folder_moves_do_not_make_a_loop() {
+        // /v/a/b/c, then: a -> b, b -> root (applied in the other order).
+        let mut index = volume(|nodes, root| {
+            let a = nodes.push_str(Parent::Root(root), "a", folder(), Some(20));
+            let b = nodes.push_str(Parent::Node(a), "b", folder(), Some(21));
+            nodes.push_str(Parent::Node(b), "c", folder(), Some(22));
+            nodes.push_str(Parent::Root(root), "gone", folder(), Some(23));
+        });
+        let present = State::Present { meta: folder(), links: 1 };
+        let changes = vec![
+            change(20, 21, "a", present.clone()),
+            change(23, 5, "gone", State::Gone),
+            change(21, 5, "b", present),
+        ];
+        let applied = apply(&mut index, changes, |_| true);
+        assert!(applied.folders_moved);
+        let p = |text: &str| Path::new("/v").join(text);
+        assert_eq!(listing(&index), [p("b"), p("b/a"), p("b/c")]);
+    }
+
+    #[test]
+    fn removed_hard_links_disappear() {
+        let mut index = volume(|nodes, root| {
+            nodes.push_str(Parent::Root(root), "keep.txt", file(1), Some(30));
+            nodes.push_str(Parent::Root(root), "gone.txt", file(1), Some(30));
+            nodes.push_str(Parent::Root(root), "x1", file(2), Some(31));
+            nodes.push_str(Parent::Root(root), "x2", file(2), Some(31));
+            nodes.push_str(Parent::Root(root), "x3", file(2), Some(31));
+        });
+        let on_disk = [Path::new("/v").join("keep.txt"), Path::new("/v").join("x1"), Path::new("/v").join("x3")];
+        // The journal names the removed link; the file itself still exists.
+        let changes = vec![
+            change(30, 5, "gone.txt", State::Present { meta: file(1), links: 1 }),
+            change(31, 5, "x2", State::Present { meta: file(2), links: 2 }),
+            // The volume root changed; it is not a node.
+            change(5, 5, ".", State::Present { meta: folder(), links: 1 }),
+        ];
+        apply(&mut index, changes, |path| on_disk.iter().any(|known| known == path));
+        let mut expected = on_disk.to_vec();
+        expected.sort();
+        assert_eq!(listing(&index), expected);
     }
 
     /// Applies the difference between two MFT snapshots as journal changes
