@@ -30,6 +30,8 @@ pub struct ScanStats {
     pub used_mft: bool,
     /// Why the MFT could not be read for a drive root, if it was tried.
     pub mft_error: Option<String>,
+    /// Where the time of a successful MFT scan went.
+    pub mft_report: Option<crate::mft::Report>,
 }
 
 /// Scans `root` recursively.
@@ -57,9 +59,10 @@ pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
     }
 
     let mft_error = match scan_drive_root(root) {
-        Some(Ok(entries)) => {
+        Some(Ok((entries, report))) => {
             let stats = ScanStats {
                 used_mft: true,
+                mft_report: Some(report),
                 ..ScanStats::default()
             };
             return Ok((entries, stats));
@@ -266,7 +269,7 @@ impl ScanBatch {
 /// root or MFT reading is turned off, and an error when the MFT cannot be
 /// read; the caller then walks the directories.
 #[cfg(windows)]
-fn scan_drive_root(root: &Path) -> Option<Result<Vec<Entry>>> {
+fn scan_drive_root(root: &Path) -> Option<Result<(Vec<Entry>, crate::mft::Report)>> {
     if std::env::var_os("EVERYRUST_NO_MFT").is_some() {
         return None;
     }
@@ -276,7 +279,9 @@ fn scan_drive_root(root: &Path) -> Option<Result<Vec<Entry>>> {
     let result = crate::mft::scan_volume_root(&root);
     if std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some() {
         match &result {
-            Ok(entries) => eprintln!("MFT read {} entries in {:?}", entries.len(), started.elapsed()),
+            Ok((entries, report)) => {
+                eprintln!("MFT read {} entries in {:?}: {report}", entries.len(), started.elapsed())
+            }
             Err(error) => eprintln!("MFT unavailable for {}: {error:#}", root.display()),
         }
     }
@@ -284,7 +289,7 @@ fn scan_drive_root(root: &Path) -> Option<Result<Vec<Entry>>> {
 }
 
 #[cfg(not(windows))]
-fn scan_drive_root(_root: &Path) -> Option<Result<Vec<Entry>>> {
+fn scan_drive_root(_root: &Path) -> Option<Result<(Vec<Entry>, crate::mft::Report)>> {
     None
 }
 
@@ -294,7 +299,7 @@ pub fn scan_local_drives() -> Result<(Vec<Entry>, ScanStats)> {
     let mut walk = Vec::new();
     for drive in local_fixed_drives() {
         match scan_drive_root(&drive) {
-            Some(Ok(mut drive_entries)) => entries.append(&mut drive_entries),
+            Some(Ok((mut drive_entries, _))) => entries.append(&mut drive_entries),
             _ => walk.push(extended_path(&drive)),
         }
     }

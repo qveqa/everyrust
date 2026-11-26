@@ -149,6 +149,8 @@ struct LoadInfo {
     unreadable: usize,
     method: &'static str,
     mft_error: Option<String>,
+    /// Timing details shown next to the method.
+    details: Option<String>,
 }
 
 struct IndexedScan {
@@ -228,6 +230,7 @@ impl App {
                     unreadable: stats.unreadable,
                     method: if stats.used_mft { "MFT" } else { "folder walk" },
                     mft_error: stats.mft_error,
+                    details: stats.mft_report.map(|report| report.to_string()),
                 };
                 (entries, info)
             })
@@ -300,10 +303,12 @@ impl App {
             let mut bytes = None;
             let result = load()
                 .map(|(entries, info)| {
+                    // Measure the scan alone, without saving the index.
+                    let took = started.elapsed();
                     if let Some((_, root)) = &saved {
                         bytes = Some(everyrust::cache::encode(root, &entries));
                     }
-                    build_scan(entries, info, sort, watch, warning, started.elapsed())
+                    build_scan(entries, info, sort, watch, warning, took)
                 })
                 .map_err(|error| format!("{error:#}"));
             if sender.send(ScanMessage::Done(result)).is_ok() {
@@ -363,10 +368,11 @@ impl App {
         self.order_sort = scan.sort;
         self.unreadable = scan.info.unreadable;
         self.scan_note = Some(format!(
-            "{} in {:.2} s ({})",
+            "{} in {:.2} s ({}{})",
             if scan.info.method == "saved index" { "loaded" } else { "indexed" },
             scan.took.as_secs_f64(),
-            scan.info.method
+            scan.info.method,
+            scan.info.details.as_deref().map(|details| format!(": {details}")).unwrap_or_default(),
         ));
         self.mft_error = scan.info.mft_error;
         self.recompute();

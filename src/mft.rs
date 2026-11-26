@@ -54,7 +54,7 @@ const NON_API_ATTRIBUTES: u32 = 0x3000_0000;
 /// Fails when `root` is not a drive root, the volume is not NTFS, or the raw
 /// volume cannot be opened (for example, without administrator privileges).
 #[cfg(windows)]
-pub fn scan_volume_root(root: &Path) -> Result<Vec<Entry>> {
+pub fn scan_volume_root(root: &Path) -> Result<(Vec<Entry>, Report)> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_SHARE_READ: u32 = 0x1;
@@ -137,13 +137,15 @@ pub fn drive_root_letter(root: &Path) -> Option<char> {
 /// is fastest with many reads in flight. Other threads parse the blocks
 /// already read. Blocks without records in use, according to the `$MFT`
 /// bitmap, are skipped.
-pub fn read_volume<R, F>(open: F, readers: usize, root: &Path) -> Result<Vec<Entry>>
+pub fn read_volume<R, F>(open: F, readers: usize, root: &Path) -> Result<(Vec<Entry>, Report)>
 where
     R: Read + Seek + Send,
     F: Fn() -> io::Result<R> + Sync,
 {
+    let started = std::time::Instant::now();
     let mut volume = open().context("cannot open the volume")?;
     let layout = Layout::load(&mut volume)?;
+    let layout_time = started.elapsed();
 
     let record_size = layout.geometry.record_size;
     let read_end = layout
@@ -271,12 +273,57 @@ where
         (parsed, read_results)
     });
     read_results.into_iter().collect::<Result<()>>()?;
+    let read_time = started.elapsed() - layout_time;
+    let read_bytes = wanted.iter().map(|&block| (read_end - block as u64 * BLOCK_BYTES).min(BLOCK_BYTES)).sum();
 
     let mut blocks: Vec<Block> = (0..block_count).map(|_| Block::default()).collect();
     for (index, block) in parsed {
         blocks[index] = block;
     }
-    build_entries(blocks, records, records_per_block, root)
+    let build_started = std::time::Instant::now();
+    let entries = build_entries(blocks, records, records_per_block, root)?;
+    let report = Report {
+        mft_bytes: read_end,
+        read_bytes,
+        readers,
+        layout_time,
+        read_time,
+        build_time: build_started.elapsed(),
+    };
+    Ok((entries, report))
+}
+
+/// Where the time of an MFT scan went.
+#[derive(Debug, Clone)]
+pub struct Report {
+    /// Allocated size of the MFT.
+    pub mft_bytes: u64,
+    /// Bytes read; blocks without records in use are skipped.
+    pub read_bytes: u64,
+    pub readers: usize,
+    /// Opening the volume and reading the boot sector and `$MFT` layout.
+    pub layout_time: std::time::Duration,
+    /// Reading and parsing the records; the two overlap.
+    pub read_time: std::time::Duration,
+    /// Joining records and building full paths.
+    pub build_time: std::time::Duration,
+}
+
+impl std::fmt::Display for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+        write!(
+            f,
+            "{:.0} of {:.0} MiB, open {:.2} s, read {:.2} s ({:.0} MiB/s, {} reader(s)), build {:.2} s",
+            mib(self.read_bytes),
+            mib(self.mft_bytes),
+            self.layout_time.as_secs_f64(),
+            self.read_time.as_secs_f64(),
+            mib(self.read_bytes) / self.read_time.as_secs_f64().max(1e-6),
+            self.readers,
+            self.build_time.as_secs_f64(),
+        )
+    }
 }
 
 /// A zeroed byte buffer whose start is aligned to [`BUFFER_ALIGN`].
@@ -1259,7 +1306,8 @@ mod tests {
         let mount = PathBuf::from(std::env::var_os("EVERYRUST_NTFS_MOUNT").unwrap());
         let started = std::time::Instant::now();
         let readers = std::env::var("EVERYRUST_MFT_READERS").map_or(8, |value| value.parse().unwrap());
-        let from_mft = read_volume(|| std::fs::File::open(&image), readers, &mount).unwrap();
+        let (from_mft, report) = read_volume(|| std::fs::File::open(&image), readers, &mount).unwrap();
+        eprintln!("{report}");
         let mft_time = started.elapsed();
         let started = std::time::Instant::now();
         let from_walk = crate::scan::scan(&mount).unwrap();
