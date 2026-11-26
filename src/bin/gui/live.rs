@@ -1,31 +1,84 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use everyrust::index::SearchIndex;
 use everyrust::model::Entry;
 use everyrust::scan;
-use everyrust::search::{self, SearchIndex, SortKey};
+use everyrust::search::{self, SortKey};
+use everyrust::usn::{Applied, Change, JournalState};
 
 const BATCH_WINDOW: Duration = Duration::from_millis(220);
+/// How often the change journal is read.
+#[cfg(windows)]
+const JOURNAL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub enum Update {
     Paths(HashMap<PathBuf, Option<Entry>>),
+    /// Journal changes and the journal position after them.
+    Journal(Vec<Change>, JournalState),
     Rescan,
     Warning(String),
 }
 
+/// Live updates for one index: file system notifications for folders, or
+/// the change journal for NTFS drives indexed from the MFT.
 pub struct Watch {
-    _watcher: RecommendedWatcher,
+    _watcher: Option<RecommendedWatcher>,
     updates: Receiver<Update>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Watch {
+    /// Reads the change journal of a drive every half second.
+    #[cfg(windows)]
+    pub fn journal(journal: everyrust::usn::Journal, mut state: JournalState, ctx: egui::Context) -> Self {
+        let (outgoing, updates) = mpsc::sync_channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                std::thread::sleep(JOURNAL_INTERVAL);
+                match journal.read(state) {
+                    Ok((changes, next)) => {
+                        state = next;
+                        if changes.is_empty() {
+                            continue;
+                        }
+                        if outgoing.send(Update::Journal(changes, next)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = outgoing.send(Update::Rescan);
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        Self {
+            _watcher: None,
+            updates,
+            stop,
+        }
+    }
+
     pub fn start(roots: &[PathBuf], ctx: egui::Context) -> (Option<Self>, Option<String>) {
         let (events, incoming) = mpsc::channel();
         let mut watcher = match notify::recommended_watcher(events) {
@@ -82,7 +135,13 @@ impl Watch {
                 }
             }
         });
-        (Some(Self { _watcher: watcher, updates }), warning)
+        let stop = Arc::new(AtomicBool::new(false));
+        (Some(Self { _watcher: Some(watcher), updates, stop }), warning)
+    }
+
+    /// Whether updates come from the change journal.
+    pub fn is_journal(&self) -> bool {
+        self._watcher.is_none()
     }
 
     pub fn poll(&self) -> Result<Update, TryRecvError> {
@@ -147,90 +206,56 @@ fn resolve(paths: HashMap<PathBuf, bool>) -> HashMap<PathBuf, Option<Entry>> {
     resolved
 }
 
-pub fn find(index: &SearchIndex, order: &[usize], path: &Path) -> Option<usize> {
-    order
-        .binary_search_by(|&id| search::compare_paths(&index.entry(id).path, path))
-        .ok()
-        .map(|row| order[row])
-}
-
-/// Applies a batch using the path order for lookups, then reinserts just the changed slots.
-pub fn apply(
-    index: &mut SearchIndex,
-    path_order: &mut Vec<usize>,
-    result_order: &mut Vec<usize>,
-    sort: (SortKey, bool),
-    changes: HashMap<PathBuf, Option<Entry>>,
-) -> bool {
-    let mut replacements = HashMap::new();
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
+/// Applies resolved path changes from file system notifications.
+pub fn apply_paths(index: &mut SearchIndex, changes: HashMap<PathBuf, Option<Entry>>) -> Applied {
+    let mut applied = Applied::default();
+    let mut changes: Vec<(PathBuf, Option<Entry>)> = changes.into_iter().collect();
+    // Removals first, then parents before their children.
+    changes.sort_by_key(|(path, entry)| (entry.is_some(), path.components().count()));
     for (path, entry) in changes {
         match entry {
-            Some(entry) => {
-                if let Some(id) = find(index, path_order, &path) {
-                    if *index.entry(id) != entry {
-                        replacements.insert(id, entry);
+            None => applied.removed.extend(index.remove_path(&path)),
+            Some(entry) => match index.find(&path) {
+                Some(id) if index.is_dir(id) == entry.is_dir => {
+                    if index.set_meta(id, entry.meta()) {
+                        applied.updated.push(id);
                     }
-                } else {
-                    added.push(entry);
                 }
-            }
-            None => {
-                let start = path_order.partition_point(|&id| {
-                    search::compare_paths(&index.entry(id).path, &path) == std::cmp::Ordering::Less
-                });
-                removed.extend(
-                    path_order[start..].iter().copied()
-                        .take_while(|&id| index.entry(id).path.starts_with(&path)),
-                );
-            }
+                found => {
+                    if let Some(id) = found {
+                        applied.removed.extend(index.remove(&[id]));
+                    }
+                    let Some(name) = path.file_name() else { continue };
+                    let parent = index.parent_for(&path);
+                    applied.updated.push(index.insert(parent, name, entry.meta(), None));
+                }
+            },
         }
     }
-    if replacements.is_empty() && added.is_empty() && removed.is_empty() {
-        return false;
-    }
+    applied.updated.retain(|&id| index.is_live(id));
+    applied
+}
 
-    let mut invalid = vec![false; index.len()];
-    let mut updated = Vec::with_capacity(replacements.len() + added.len() + removed.len());
-    for (id, entry) in replacements {
-        index.replace_entry(id, entry);
-        invalid[id] = true;
-        updated.push(id);
+/// Brings a sorted result order up to date after changes.
+pub fn update_order(index: &SearchIndex, order: &mut Vec<usize>, sort: (SortKey, bool), applied: &Applied) {
+    if sort.0 == SortKey::Path && applied.folders_moved {
+        // Paths below a moved folder changed; sort again.
+        *order = index.ids();
+        search::sort_hits(index, order, sort.0, sort.1);
+        return;
     }
-    removed.sort_unstable();
-    removed.dedup();
-    // Removing in descending slot order keeps the original deletion slots valid.
-    // Record which original entry moved into any surviving hole.
-    let mut moved = HashMap::new();
-    for id in removed.into_iter().rev() {
-        invalid[id] = true;
-        let tail = index.len() - 1;
-        if id != tail {
-            let original = moved.remove(&tail).unwrap_or(tail);
-            invalid[original] = true;
-            moved.insert(id, original);
-        }
-        index.swap_remove_entry(id);
+    let mut touched = vec![false; index.len()];
+    for &id in applied.removed.iter().chain(&applied.updated) {
+        touched[id] = true;
     }
-    updated.retain(|&id| id < index.len());
-    updated.extend(moved.into_keys());
-    updated.extend(index.len()..index.len() + added.len());
-    for entry in added {
-        index.push_entry(entry);
-    }
-    updated.sort_unstable();
-    updated.dedup();
-    path_order.retain(|&id| !invalid[id]);
-    result_order.retain(|&id| !invalid[id]);
-    search::insert_sorted_indices(index, path_order, &updated, SortKey::Path, false);
-    search::insert_sorted_indices(index, result_order, &updated, sort.0, sort.1);
-    true
+    order.retain(|&id| !touched[id]);
+    search::insert_sorted_indices(index, order, &applied.updated, sort.0, sort.1);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use everyrust::search::{Query, SearchOptions};
 
     fn file(path: &str, size: u64) -> Entry {
@@ -258,10 +283,9 @@ mod tests {
             ],
             true,
         );
-        let mut paths: Vec<usize> = (0..index.len()).collect();
-        search::sort_hits(&index, &mut paths, SortKey::Path, false);
-        let mut order: Vec<usize> = (0..index.len()).collect();
-        search::sort_hits(&index, &mut order, SortKey::Size, true);
+        let sort = (SortKey::Size, true);
+        let mut order = index.ids();
+        search::sort_hits(&index, &mut order, sort.0, sort.1);
         let options = SearchOptions { match_path: true, ..Default::default() };
         let query = Query::parse("new", options).unwrap();
         assert!(search::filter_ordered_indices(&index, &query, &order).is_empty());
@@ -272,15 +296,19 @@ mod tests {
             (PathBuf::from("new.txt"), Some(file("new.txt", 17))),
             (PathBuf::from("new-large.txt"), Some(file("new-large.txt", GIB))),
         ]);
-        assert!(apply(&mut index, &mut paths, &mut order, (SortKey::Size, true), changes));
-        assert_eq!(index.len(), 4);
-        assert_eq!(paths.iter().map(|&id| index.entry(id).name_string()).collect::<Vec<_>>(),
-            ["keep.txt", "new-large.txt", "new.txt", "outside.txt"]);
-        assert_eq!(order.iter().map(|&id| index.entry(id).name_string()).collect::<Vec<_>>(),
-            ["outside.txt", "new-large.txt", "new.txt", "keep.txt"]);
-        assert_eq!(index.entry(order[0]).size, Some(2 * GIB));
+        let applied = apply_paths(&mut index, changes);
+        assert!(!applied.is_empty());
+        update_order(&index, &mut order, sort, &applied);
+        assert_eq!(index.live_len(), 4);
+        let outside = index.find(Path::new("outside.txt")).unwrap();
+        let names = |ids: &[usize]| ids.iter().map(|&id| index.name(id).to_owned()).collect::<Vec<_>>();
+        assert_eq!(names(&order), ["outside.txt", "new-large.txt", "new.txt", "keep.txt"]);
+        assert_eq!(index.size(outside), Some(2 * GIB));
         let hits = search::filter_ordered_indices(&index, &query, &order);
-        assert_eq!(hits.iter().map(|&id| index.entry(id).name_string()).collect::<Vec<_>>(),
-            ["new-large.txt", "new.txt"]);
+        assert_eq!(names(&hits), ["new-large.txt", "new.txt"]);
+
+        let mut paths = index.ids();
+        search::sort_hits(&index, &mut paths, SortKey::Path, false);
+        assert_eq!(names(&paths), ["keep.txt", "new-large.txt", "new.txt", "outside.txt"]);
     }
 }

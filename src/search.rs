@@ -11,15 +11,16 @@
 //! - matching is case-insensitive unless `--case` is given;
 //! - `--whole-word` requires word boundaries around literal terms.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 use memchr::memmem::Finder;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 
+pub use crate::index::SearchIndex;
 use crate::model::Entry;
 
 /// Result ordering.
@@ -91,7 +92,24 @@ impl Query {
 
     /// Whether entry `index` matches one of the alternatives.
     pub fn matches(&self, index: &SearchIndex, entry_index: usize) -> bool {
-        let (original, lowered) = index.target_text(entry_index, self.options.match_path);
+        if !index.is_live(entry_index) {
+            return false;
+        }
+        if !self.options.match_path {
+            return self.matches_text(index.name(entry_index), index.name_lower(entry_index));
+        }
+        thread_local! {
+            static BUFFERS: RefCell<(Vec<u32>, String, String)> = RefCell::default();
+        }
+        BUFFERS.with(|buffers| {
+            let (chain, original, lowered) = &mut *buffers.borrow_mut();
+            index.write_path(entry_index, false, chain, original);
+            index.write_path(entry_index, true, chain, lowered);
+            self.matches_text(original, lowered)
+        })
+    }
+
+    fn matches_text(&self, original: &str, lowered: &str) -> bool {
         self.alternatives.iter().any(|terms| {
             terms
                 .iter()
@@ -113,147 +131,19 @@ impl Term {
     }
 }
 
-/// Builds an index over entries for repeated searches.
-pub struct SearchIndex {
-    entries: Vec<Entry>,
-    names: Vec<String>,
-    names_lower: Vec<String>,
-    paths: Option<OnceLock<(Vec<String>, Vec<String>)>>,
-    /// Whether `entries` are in [`compare_paths`] order. Then the entry index
-    /// replaces the path as the tie-break, which makes sorting much cheaper.
-    path_sorted: bool,
-}
-
-impl SearchIndex {
-    /// Builds the index. When `need_paths` is set, the first path query
-    /// caches the full-path strings for subsequent searches.
-    pub fn new(entries: Vec<Entry>, need_paths: bool) -> Self {
-        let (names, names_lower) = entries
-            .par_iter()
-            .map(|entry| {
-                let name = entry.name_string();
-                let lower = name.to_lowercase();
-                (name, lower)
-            })
-            .unzip();
-        let path_sorted = entries
-            .par_windows(2)
-            .all(|pair| compare_paths(&pair[0].path, &pair[1].path) != Ordering::Greater);
-        Self {
-            entries,
-            names,
-            names_lower,
-            paths: need_paths.then(OnceLock::new),
-            path_sorted,
-        }
-    }
-
-    /// Whether entry indexes follow the path order.
-    pub fn is_path_sorted(&self) -> bool {
-        self.path_sorted
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn entry(&self, index: usize) -> &Entry {
-        &self.entries[index]
-    }
-
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
-    pub fn name_lower(&self, index: usize) -> &str {
-        &self.names_lower[index]
-    }
-
-    pub fn replace_entry(&mut self, index: usize, entry: Entry) {
-        if entry.path.as_os_str() != self.entries[index].path.as_os_str() {
-            self.path_sorted = false;
-            let name = entry.name_string();
-            self.names_lower[index] = name.to_lowercase();
-            self.names[index] = name;
-            if let Some((paths, paths_lower)) = self.paths.as_mut().and_then(OnceLock::get_mut) {
-                let path = entry.path.to_string_lossy();
-                paths_lower[index] = path.to_lowercase();
-                paths[index] = path.into_owned();
-            }
-        }
-        self.entries[index] = entry;
-    }
-
-    pub fn push_entry(&mut self, entry: Entry) {
-        self.path_sorted &= self
-            .entries
-            .last()
-            .is_none_or(|last| compare_paths(&last.path, &entry.path) != Ordering::Greater);
-        let name = entry.name_string();
-        self.names_lower.push(name.to_lowercase());
-        self.names.push(name);
-        if let Some((paths, paths_lower)) = self.paths.as_mut().and_then(OnceLock::get_mut) {
-            let path = entry.path.to_string_lossy();
-            paths_lower.push(path.to_lowercase());
-            paths.push(path.into_owned());
-        }
-        self.entries.push(entry);
-    }
-
-    pub fn swap_remove_entry(&mut self, index: usize) {
-        // Moving the last entry into the hole breaks the path order.
-        self.path_sorted &= index + 1 == self.entries.len();
-        self.entries.swap_remove(index);
-        self.names.swap_remove(index);
-        self.names_lower.swap_remove(index);
-        if let Some((paths, paths_lower)) = self.paths.as_mut().and_then(OnceLock::get_mut) {
-            paths.swap_remove(index);
-            paths_lower.swap_remove(index);
-        }
-    }
-
-    fn target_text(&self, index: usize, match_path: bool) -> (&str, &str) {
-        if match_path {
-            if let Some((paths, paths_lower)) = self.search_paths() {
-                return (&paths[index], &paths_lower[index]);
-            }
-        }
-        (&self.names[index], &self.names_lower[index])
-    }
-
-    fn search_paths(&self) -> Option<&(Vec<String>, Vec<String>)> {
-        self.paths.as_ref().map(|paths| {
-            paths.get_or_init(|| {
-                self.entries
-                    .iter()
-                    .map(|entry| {
-                        let path = entry.path.to_string_lossy();
-                        let lowered = path.to_lowercase();
-                        (path.into_owned(), lowered)
-                    })
-                    .unzip()
-            })
-        })
-    }
-}
-
 /// Runs a query over the index and returns matching entries.
 ///
 /// Results are sorted by `sort` in the requested direction and truncated to
 /// `limit`. Size sorting keeps directories and unknown sizes at the end.
-pub fn search<'a>(
-    index: &'a SearchIndex,
+pub fn search(
+    index: &SearchIndex,
     query: &Query,
     sort: SortKey,
     descending: bool,
     limit: Option<usize>,
-) -> Vec<&'a Entry> {
+) -> Vec<Entry> {
     search_indices(index, query, sort, descending, limit)
-        .into_iter()
+        .into_par_iter()
         .map(|i| index.entry(i))
         .collect()
 }
@@ -294,10 +184,6 @@ fn filter_indices(
     query: &Query,
     indices: impl IndexedParallelIterator<Item = usize>,
 ) -> Vec<usize> {
-    if query.options.match_path {
-        // Initialize the shared cache before workers start reading it.
-        index.search_paths();
-    }
     let uses_regex = query
         .alternatives
         .iter()
@@ -322,13 +208,13 @@ fn filter_indices(
 /// key, which avoids reading the entries and keeps the sort cache-friendly.
 pub fn sort_hits(index: &SearchIndex, hits: &mut [usize], sort: SortKey, descending: bool) {
     let direct = |ordering: Ordering| if descending { ordering.reverse() } else { ordering };
+    let ranks = index.path_ranks();
+    let path_order = |a: usize, b: usize| match ranks {
+        Some(ranks) => ranks[a].cmp(&ranks[b]),
+        None => a.cmp(&b),
+    };
     if sort == SortKey::Path {
-        if index.is_path_sorted() {
-            // Index order is path order.
-            hits.par_sort_unstable_by(|a, b| direct(a.cmp(b)));
-        } else {
-            hits.par_sort_unstable_by(|&a, &b| direct(path_tie_break(index, a, b)).then_with(|| a.cmp(&b)));
-        }
+        hits.par_sort_unstable_by(|&a, &b| direct(path_order(a, b)));
         return;
     }
     let mut keyed: Vec<(u128, usize)> = hits
@@ -341,7 +227,7 @@ pub fn sort_hits(index: &SearchIndex, hits: &mut [usize], sort: SortKey, descend
                 SortKey::Name => index.name_lower(a).cmp(index.name_lower(b)),
                 _ => Ordering::Equal,
             };
-            direct(tie.then_with(|| path_tie_break(index, a, b))).then_with(|| a.cmp(&b))
+            direct(tie.then_with(|| path_order(a, b)))
         })
     });
     hits.par_iter_mut()
@@ -349,30 +235,20 @@ pub fn sort_hits(index: &SearchIndex, hits: &mut [usize], sort: SortKey, descend
         .for_each(|(hit, &(_, sorted))| *hit = sorted);
 }
 
-/// Compares two entries by path, using the entry index when it is equivalent.
-fn path_tie_break(index: &SearchIndex, a: usize, b: usize) -> Ordering {
-    if index.is_path_sorted() {
-        a.cmp(&b)
-    } else {
-        compare_paths(&index.entry(a).path, &index.entry(b).path)
-    }
-}
-
 /// A key whose ascending order matches [`compare_entries`] up to its tie-break.
-fn sort_key(index: &SearchIndex, entry_index: usize, sort: SortKey, descending: bool) -> u128 {
-    let entry = index.entry(entry_index);
+fn sort_key(index: &SearchIndex, id: usize, sort: SortKey, descending: bool) -> u128 {
     let direct = |value: u64| u128::from(if descending { !value } else { value });
     match sort {
         // Directories and unknown sizes come last in both directions.
-        SortKey::Size => match entry.size.filter(|_| !entry.is_dir) {
+        SortKey::Size => match index.size(id).filter(|_| !index.is_dir(id)) {
             Some(size) => direct(size),
             None => 1 << 64,
         },
-        SortKey::Modified => direct(entry.modified.unwrap_or(0)),
+        SortKey::Modified => direct(index.modified(id).unwrap_or(0)),
         SortKey::Name => {
             // The first eight bytes, zero-padded, order like the whole name.
             let mut prefix = [0; 8];
-            let name = index.name_lower(entry_index).as_bytes();
+            let name = index.name_lower(id).as_bytes();
             let length = name.len().min(8);
             prefix[..length].copy_from_slice(&name[..length]);
             direct(u64::from_be_bytes(prefix))
@@ -432,17 +308,26 @@ pub fn insert_sorted_indices(
     sort: SortKey,
     descending: bool,
 ) {
-    if updated.len() > 32 {
-        order.extend_from_slice(updated);
-        sort_hits(index, order, sort, descending);
+    if updated.is_empty() {
         return;
     }
-    for &new_index in updated {
-        let position = order.partition_point(|&existing| {
-            compare_entries(index, existing, new_index, sort, descending) != Ordering::Greater
-        });
-        order.insert(position, new_index);
+    let compare = |a: usize, b: usize| compare_entries(index, a, b, sort, descending).then_with(|| a.cmp(&b));
+    let mut updated = updated.to_vec();
+    updated.sort_by(|&a, &b| compare(a, b));
+    // Find each position by binary search, then merge in one pass.
+    let positions: Vec<usize> = updated
+        .iter()
+        .map(|&new| order.partition_point(|&existing| compare(existing, new) != Ordering::Greater))
+        .collect();
+    let mut merged = Vec::with_capacity(order.len() + updated.len());
+    let mut last = 0;
+    for (&new, &position) in updated.iter().zip(&positions) {
+        merged.extend_from_slice(&order[last..position]);
+        merged.push(new);
+        last = position;
     }
+    merged.extend_from_slice(&order[last..]);
+    *order = merged;
 }
 
 fn compare_entries(
@@ -452,23 +337,21 @@ fn compare_entries(
     sort: SortKey,
     descending: bool,
 ) -> Ordering {
-    let left = index.entry(a);
-    let right = index.entry(b);
     let ordering = match sort {
         SortKey::Name => index.name_lower(a).cmp(index.name_lower(b)),
-        SortKey::Path => path_tie_break(index, a, b),
+        SortKey::Path => Ordering::Equal,
         SortKey::Size => {
-            let left_size = left.size.filter(|_| !left.is_dir);
-            let right_size = right.size.filter(|_| !right.is_dir);
+            let left_size = index.size(a).filter(|_| !index.is_dir(a));
+            let right_size = index.size(b).filter(|_| !index.is_dir(b));
             match (left_size, right_size) {
                 (Some(left), Some(right)) => left.cmp(&right),
                 (None, None) => Ordering::Equal,
                 _ => return left_size.is_none().cmp(&right_size.is_none()),
             }
         }
-        SortKey::Modified => left.modified.unwrap_or(0).cmp(&right.modified.unwrap_or(0)),
+        SortKey::Modified => index.modified(a).unwrap_or(0).cmp(&index.modified(b).unwrap_or(0)),
     };
-    let ordering = ordering.then_with(|| path_tie_break(index, a, b));
+    let ordering = ordering.then_with(|| index.compare_by_path(a, b));
     if descending {
         ordering.reverse()
     } else {
@@ -709,12 +592,13 @@ mod tests {
         files[4].size = Some(0);
         let index = SearchIndex::new(files, false);
         let mut hits = [0, 1, 2, 3, 4];
+        let names = |hits: &[usize]| hits.iter().map(|&hit| index.name(hit).to_owned()).collect::<Vec<_>>();
 
         sort_hits(&index, &mut hits, SortKey::Size, true);
-        assert_eq!(hits, [1, 0, 4, 2, 3]);
+        assert_eq!(names(&hits), ["largest", "small", "empty", "unknown", "folder"]);
 
         sort_hits(&index, &mut hits, SortKey::Size, false);
-        assert_eq!(hits, [4, 0, 1, 3, 2]);
+        assert_eq!(names(&hits), ["empty", "small", "largest", "folder", "unknown"]);
     }
 
     #[test]
@@ -753,7 +637,6 @@ mod tests {
         files[0].size = Some(5);
         files[3].is_dir = true;
         let shuffled = SearchIndex::new(files.clone(), false);
-        assert!(!shuffled.is_path_sorted());
         files.sort_by(|a, b| compare_paths(&a.path, &b.path));
         let ordered = SearchIndex::new(files, false);
         assert!(ordered.is_path_sorted());
@@ -762,7 +645,7 @@ mod tests {
                 let names = |index: &SearchIndex| {
                     let mut hits: Vec<usize> = (0..index.len()).collect();
                     sort_hits(index, &mut hits, sort, descending);
-                    hits.iter().map(|&hit| index.entry(hit).path.clone()).collect::<Vec<_>>()
+                    hits.iter().map(|&hit| index.path(hit)).collect::<Vec<_>>()
                 };
                 assert_eq!(names(&shuffled), names(&ordered), "{sort:?} {descending}");
             }

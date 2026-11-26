@@ -15,8 +15,10 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 
+use crate::index::{Nodes, SearchIndex};
 use crate::model::Entry;
 use crate::timeutil;
+use crate::usn::JournalState;
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -26,17 +28,37 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub struct ScanStats {
     /// Number of read errors encountered during the directory walk.
     pub unreadable: usize,
-    /// Whether the entries came from the NTFS Master File Table.
+    /// Whether the index came from the NTFS Master File Table. Its nodes
+    /// then carry MFT record numbers for the change journal.
     pub used_mft: bool,
-    /// Why the MFT could not be read for a drive root, if it was tried.
-    pub mft_error: Option<String>,
-    /// Where the time of a successful MFT scan went.
-    pub mft_report: Option<crate::mft::Report>,
+    /// The change journal position from just before the MFT was read.
+    pub journal: Option<JournalState>,
 }
 
 /// Scans `root` recursively.
 pub fn scan(root: &Path) -> Result<Vec<Entry>> {
     scan_with_stats(root).map(|(entries, _stats)| entries)
+}
+
+/// Scans `root` recursively into an index.
+pub fn scan_index(root: &Path) -> Result<(SearchIndex, ScanStats)> {
+    match scan_source(root)? {
+        Source::Nodes(nodes, stats) => Ok((SearchIndex::from_nodes(nodes, true), stats)),
+        Source::Entries(entries, stats) => Ok((SearchIndex::new(entries, false), stats)),
+    }
+}
+
+/// Scans `root` recursively, also reporting unreadable entries.
+pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
+    match scan_source(root)? {
+        Source::Nodes(nodes, stats) => Ok((SearchIndex::from_nodes(nodes, true).entries(), stats)),
+        Source::Entries(entries, stats) => Ok((entries, stats)),
+    }
+}
+
+enum Source {
+    Nodes(Nodes, ScanStats),
+    Entries(Vec<Entry>, ScanStats),
 }
 
 /// Reads one path's metadata without following a symlink or junction.
@@ -46,30 +68,23 @@ pub fn read_entry(path: PathBuf) -> std::io::Result<Entry> {
     Ok(entry_with_metadata(path, Some(metadata), is_dir))
 }
 
-/// Scans `root` recursively, also reporting unreadable entries.
-pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
+fn scan_source(root: &Path) -> Result<Source> {
     let metadata = fs::symlink_metadata(root)
         .with_context(|| format!("cannot read {}: no such file or directory", root.display()))?;
 
     if !metadata.is_dir() {
-        return Ok((
-            vec![entry_with_metadata(root.to_path_buf(), Some(metadata), false)],
-            ScanStats::default(),
-        ));
+        let entries = vec![entry_with_metadata(root.to_path_buf(), Some(metadata), false)];
+        return Ok(Source::Entries(entries, ScanStats::default()));
     }
 
-    let mft_error = match scan_drive_root(root) {
-        Some(Ok((entries, report))) => {
-            let stats = ScanStats {
-                used_mft: true,
-                mft_report: Some(report),
-                ..ScanStats::default()
-            };
-            return Ok((entries, stats));
-        }
-        Some(Err(error)) => Some(format!("{error:#}")),
-        None => None,
-    };
+    if let Some(Ok((nodes, journal))) = scan_drive_root(root) {
+        let stats = ScanStats {
+            used_mft: true,
+            journal,
+            ..ScanStats::default()
+        };
+        return Ok(Source::Nodes(nodes, stats));
+    }
 
     // Walk through an extended-length (`\\?\`) root so files deeper than
     // MAX_PATH are still reachable without a longPathAware manifest.
@@ -78,9 +93,8 @@ pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
     #[cfg(not(windows))]
     let directory = root.to_path_buf();
 
-    let (entries, mut stats) = scan_directories(vec![directory]);
-    stats.mft_error = mft_error;
-    Ok((entries, stats))
+    let (entries, stats) = scan_directories(vec![directory]);
+    Ok(Source::Entries(entries, stats))
 }
 
 fn scan_directories(directories: Vec<PathBuf>) -> (Vec<Entry>, ScanStats) {
@@ -269,43 +283,35 @@ impl ScanBatch {
 /// root or MFT reading is turned off, and an error when the MFT cannot be
 /// read; the caller then walks the directories.
 #[cfg(windows)]
-fn scan_drive_root(root: &Path) -> Option<Result<(Vec<Entry>, crate::mft::Report)>> {
+fn scan_drive_root(root: &Path) -> Option<Result<(Nodes, Option<JournalState>)>> {
     if std::env::var_os("EVERYRUST_NO_MFT").is_some() {
         return None;
     }
     let root = std::path::absolute(root).ok()?;
-    crate::mft::drive_root_letter(&root)?;
+    let letter = crate::mft::drive_root_letter(&root)?;
+    let debug = std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some();
+    // Take the journal position first, so changes made during the scan are
+    // replayed later rather than lost.
+    let journal = crate::usn::Journal::open(letter).and_then(|journal| journal.state());
+    if debug {
+        if let Err(error) = &journal {
+            eprintln!("change journal unavailable: {error:#}");
+        }
+    }
     let started = std::time::Instant::now();
     let result = crate::mft::scan_volume_root(&root);
-    if std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some() {
+    if debug {
         match &result {
-            Ok((entries, report)) => {
-                eprintln!("MFT read {} entries in {:?}: {report}", entries.len(), started.elapsed())
-            }
+            Ok((nodes, report)) => eprintln!("MFT read {} entries in {:?}: {report}", nodes.len(), started.elapsed()),
             Err(error) => eprintln!("MFT unavailable for {}: {error:#}", root.display()),
         }
     }
-    Some(result)
+    Some(result.map(|(nodes, _)| (nodes, journal.ok())))
 }
 
 #[cfg(not(windows))]
-fn scan_drive_root(_root: &Path) -> Option<Result<(Vec<Entry>, crate::mft::Report)>> {
+fn scan_drive_root(_root: &Path) -> Option<Result<(Nodes, Option<JournalState>)>> {
     None
-}
-
-/// Scans every fixed local drive (e.g. `C:\`, `D:\`) and merges the results.
-pub fn scan_local_drives() -> Result<(Vec<Entry>, ScanStats)> {
-    let mut entries = Vec::new();
-    let mut walk = Vec::new();
-    for drive in local_fixed_drives() {
-        match scan_drive_root(&drive) {
-            Some(Ok((mut drive_entries, _))) => entries.append(&mut drive_entries),
-            _ => walk.push(extended_path(&drive)),
-        }
-    }
-    let (mut walked, stats) = scan_directories(walk);
-    entries.append(&mut walked);
-    Ok((entries, stats))
 }
 
 /// The fixed local drives as root paths (`C:\`, `D:\`, ...).
@@ -340,6 +346,7 @@ pub fn local_fixed_drives() -> Vec<PathBuf> {
 }
 
 /// `C:\dir` -> `\\?\C:\dir` so the Windows API accepts paths over MAX_PATH.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn extended_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if text.starts_with(r"\\?\") {

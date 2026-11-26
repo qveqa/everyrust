@@ -229,24 +229,23 @@ fn execute(options: Options) -> Result<()> {
         bail!("use either -filelist or -root, not both");
     }
 
-    let entries: Vec<Entry> = if let Some(filelist) = &options.filelist {
+    let index = if let Some(filelist) = &options.filelist {
         if options.verbose {
             eprintln!("loading {}", filelist.display());
         }
-        efu::read_file_list(filelist)?
+        SearchIndex::new(efu::read_file_list(filelist)?, options.match_path)
     } else if let Some(root) = &options.root {
         if options.verbose {
             eprintln!("scanning {} ...", root.display());
         }
-        scan::scan(root)?
+        scan::scan_index(root)?.0
     } else {
         bail!("nothing to search: pass -filelist <list.efu> or -root <folder>");
     };
 
     if options.verbose {
-        eprintln!("indexed {} entries", entries.len());
+        eprintln!("indexed {} entries", index.live_len());
     }
-    let index = SearchIndex::new(entries, options.match_path);
     let search_options = SearchOptions {
         case_sensitive: options.case_sensitive,
         whole_word: options.whole_word,
@@ -261,7 +260,7 @@ fn execute(options: Options) -> Result<()> {
     Ok(())
 }
 
-fn output(hits: &[&Entry], options: &Options) -> Result<()> {
+fn output(hits: &[Entry], options: &Options) -> Result<()> {
     if let Some(path) = &options.export_txt {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {

@@ -10,14 +10,14 @@
 //! The parser works on any `Read + Seek` source, so tests can use an NTFS
 //! image file.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 
-use crate::model::Entry;
+use crate::index::{Meta, Nodes, Parent};
 
 /// Record of the volume's root folder.
 const ROOT_RECORD: u64 = 5;
@@ -54,7 +54,7 @@ const NON_API_ATTRIBUTES: u32 = 0x3000_0000;
 /// Fails when `root` is not a drive root, the volume is not NTFS, or the raw
 /// volume cannot be opened (for example, without administrator privileges).
 #[cfg(windows)]
-pub fn scan_volume_root(root: &Path) -> Result<(Vec<Entry>, Report)> {
+pub fn scan_volume_root(root: &Path) -> Result<(Nodes, Report)> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_SHARE_READ: u32 = 0x1;
@@ -65,7 +65,7 @@ pub fn scan_volume_root(root: &Path) -> Result<(Vec<Entry>, Report)> {
     // Keep the caller's spelling, such as `c:\`, so paths match the ones the
     // file watcher reports for the same root.
     let text = root.to_str().context("not a drive root")?;
-    let display = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text));
+    let display = std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text));
     let device = format!(r"\\.\{letter}:");
     // Read straight into our aligned buffers instead of through the file
     // cache, which reads a volume in small pieces and copies every byte.
@@ -150,7 +150,7 @@ pub fn drive_root_letter(root: &Path) -> Option<char> {
 /// is fastest with many reads in flight. Other threads parse the blocks
 /// already read. Blocks without records in use, according to the `$MFT`
 /// bitmap, are skipped.
-pub fn read_volume<R, F>(open: F, readers: usize, block_bytes: u64, root: &Path) -> Result<(Vec<Entry>, Report)>
+pub fn read_volume<R, F>(open: F, readers: usize, block_bytes: u64, root: &Path) -> Result<(Nodes, Report)>
 where
     R: Read + Seek + Send,
     F: Fn() -> io::Result<R> + Sync,
@@ -301,7 +301,7 @@ where
         blocks[index] = block;
     }
     let build_started = std::time::Instant::now();
-    let entries = build_entries(blocks, records, records_per_block, root)?;
+    let nodes = build_nodes(blocks, records, records_per_block, root)?;
     let report = Report {
         mft_bytes: read_end,
         read_bytes,
@@ -311,7 +311,7 @@ where
         read_time,
         build_time: build_started.elapsed(),
     };
-    Ok((entries, report))
+    Ok((nodes, report))
 }
 
 /// Where the time of an MFT scan went.
@@ -1015,7 +1015,7 @@ impl Records {
 }
 
 /// Builds full paths for every record, in [`crate::search::compare_paths`] order.
-fn build_entries(blocks: Vec<Block>, record_count: u64, per_block: u64, root: &Path) -> Result<Vec<Entry>> {
+fn build_nodes(blocks: Vec<Block>, record_count: u64, per_block: u64, root: &Path) -> Result<Nodes> {
     let mut records = Records::new(blocks, record_count, per_block);
     records.merge_extensions();
     let records = &records;
@@ -1036,7 +1036,7 @@ fn build_entries(blocks: Vec<Block>, record_count: u64, per_block: u64, root: &P
             .folder(reference)
             .map(|folder| folder_ids[folder.number as usize])
     };
-    let paths = folder_paths(records, &folders, parent_id, root.as_os_str());
+    let reachable = folder_reachable(records, &folders, parent_id);
 
     // List every reachable name as (parent folder, record, name), grouped by
     // folder and sorted by name inside each folder.
@@ -1044,10 +1044,10 @@ fn build_entries(blocks: Vec<Block>, record_count: u64, per_block: u64, root: &P
         .iter()
         .filter(|record| record.base == 0 && record.number >= FIRST_USER_RECORD)
         .flat_map_iter(|record| {
-            let paths = &paths;
+            let reachable = &reachable;
             record.names().enumerate().filter_map(move |(index, name)| {
                 let parent = parent_id(name.parent)?;
-                paths[parent as usize].as_ref()?;
+                reachable[parent as usize].then_some(())?;
                 Some((parent, record.number as u32, index as u32))
             })
         })
@@ -1061,8 +1061,8 @@ fn build_entries(blocks: Vec<Block>, record_count: u64, per_block: u64, root: &P
         .par_chunk_by_mut(|left, right| left.0 == right.0)
         .for_each(|group| group.sort_unstable_by(|left, right| compare_names(name_of(left), name_of(right))));
 
-    // A depth-first walk over the sorted groups yields the entries in path
-    // order, so later sorts can use the entry index instead of the path.
+    // A depth-first walk over the sorted groups yields the nodes in path
+    // order, so later sorts can use the node id instead of the path.
     let mut children = vec![(0u32, 0u32); folders.len()];
     let mut start = 0;
     for group in items.chunk_by(|left, right| left.0 == right.0) {
@@ -1070,38 +1070,67 @@ fn build_entries(blocks: Vec<Block>, record_count: u64, per_block: u64, root: &P
         start += group.len();
     }
     // Without a readable root record, the walk gives better results.
-    let root = folder_ids
+    let root_folder = folder_ids
         .get(ROOT_RECORD as usize)
         .copied()
         .filter(|&id| id != NONE)
         .context("the root folder record is damaged")?;
-    let mut order = Vec::with_capacity(items.len());
-    {
-        let mut stack = vec![children[root as usize]];
-        while let Some((next, end)) = stack.last_mut() {
-            if next == end {
-                stack.pop();
-                continue;
-            }
-            let item = items[*next as usize];
-            *next += 1;
-            order.push(item);
-            let (_, record, index) = item;
-            let folder = folder_ids[record as usize];
-            if index == 0 && folder != NONE {
-                stack.push(children[folder as usize]);
-            }
+    let name_bytes: usize = items.len() * 16;
+    let mut nodes = Nodes::with_capacity(items.len(), name_bytes);
+    let root_number = nodes.add_root(root.as_os_str().to_owned());
+    nodes.set_root_record(ROOT_RECORD as u32, root_number);
+    // Node of each folder, by folder id, once it has been added.
+    let mut folder_nodes = vec![NONE; folders.len()];
+    let mut text = String::new();
+    let mut stack = vec![children[root_folder as usize]];
+    while let Some((next, end)) = stack.last_mut() {
+        if next == end {
+            stack.pop();
+            continue;
+        }
+        let (parent_folder, record_number, index) = items[*next as usize];
+        *next += 1;
+        let record = records.get(u64::from(record_number)).expect("listed record");
+        let parent = if parent_folder == root_folder {
+            Parent::Root(root_number)
+        } else {
+            Parent::Node(folder_nodes[parent_folder as usize])
+        };
+        let name = records.name(record.name(index as usize));
+        let meta = make_meta(record);
+        let id = match decode_name(name, &mut text) {
+            true => nodes.push_str(parent, &text, meta, Some(record_number)),
+            false => nodes.push(parent, &wide_to_os(name), meta, Some(record_number)),
+        };
+        let folder = folder_ids[record_number as usize];
+        if index == 0 && folder != NONE {
+            folder_nodes[folder as usize] = id;
+            stack.push(children[folder as usize]);
         }
     }
+    Ok(nodes)
+}
 
-    Ok(order
-        .into_par_iter()
-        .map(|(parent, record, index)| {
-            let record = records.get(u64::from(record)).expect("listed record");
-            let parent = paths[parent as usize].as_deref().expect("reachable folder");
-            make_entry(record, join(parent, records.name(record.name(index as usize))))
-        })
-        .collect())
+/// Decodes a UTF-16 name into `text`. False when it is not valid Unicode.
+fn decode_name(name: &[u16], text: &mut String) -> bool {
+    text.clear();
+    for unit in char::decode_utf16(name.iter().copied()) {
+        match unit {
+            Ok(ch) => text.push(ch),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn wide_to_os(name: &[u16]) -> OsString {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(name)
+    }
+    #[cfg(not(windows))]
+    OsString::from(String::from_utf16_lossy(name))
 }
 
 /// Orders UTF-16 names by code point, which is the byte order of their
@@ -1120,14 +1149,9 @@ fn code_points(name: &[u16]) -> impl Iterator<Item = u32> + '_ {
     })
 }
 
-/// Full path of every folder, by folder id. `None` marks folders that are
-/// unreachable from the root, such as the contents of `$Extend`.
-fn folder_paths(
-    records: &Records,
-    folders: &[u64],
-    parent_id: impl Fn(u64) -> Option<u32>,
-    root: &OsStr,
-) -> Vec<Option<OsString>> {
+/// Whether each folder, by folder id, is reachable from the root. Folders
+/// such as the contents of `$Extend` are not.
+fn folder_reachable(records: &Records, folders: &[u64], parent_id: impl Fn(u64) -> Option<u32>) -> Vec<bool> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         New,
@@ -1135,7 +1159,7 @@ fn folder_paths(
         Done,
     }
     let mut state = vec![State::New; folders.len()];
-    let mut paths: Vec<Option<OsString>> = vec![None; folders.len()];
+    let mut reachable = vec![false; folders.len()];
     let mut stack = Vec::new();
     for start in 0..folders.len() {
         if state[start] == State::Done {
@@ -1148,14 +1172,13 @@ fn folder_paths(
                 continue;
             }
             let record = records.get(folders[current]).expect("folder record");
-            let name = record.first_name.as_ref();
             let parent = if record.number == ROOT_RECORD {
-                paths[current] = Some(root.to_owned());
+                reachable[current] = true;
                 None
             } else if record.number < FIRST_USER_RECORD {
                 None
             } else {
-                name.and_then(|name| parent_id(name.parent)).map(|id| id as usize)
+                record.first_name.as_ref().and_then(|name| parent_id(name.parent)).map(|id| id as usize)
             };
             match parent.map(|parent| (parent, state[parent])) {
                 Some((parent, State::New)) => {
@@ -1163,12 +1186,7 @@ fn folder_paths(
                     stack.push(parent);
                     continue;
                 }
-                Some((parent, State::Done)) => {
-                    paths[current] = paths[parent]
-                        .as_ref()
-                        .zip(name)
-                        .map(|(path, name)| join(path, records.name(name)));
-                }
+                Some((parent, State::Done)) => reachable[current] = reachable[parent],
                 // A cycle or a missing parent: the folder is unreachable.
                 Some((_, State::Visiting)) | None => {}
             }
@@ -1176,10 +1194,10 @@ fn folder_paths(
             stack.pop();
         }
     }
-    paths
+    reachable
 }
 
-fn make_entry(record: &FileRecord, path: OsString) -> Entry {
+fn make_meta(record: &FileRecord) -> Meta {
     let mut attributes = record.times.map_or(0, |times| times.attributes) & !NON_API_ATTRIBUTES;
     if record.is_dir {
         attributes |= FILE_ATTRIBUTE_DIRECTORY;
@@ -1187,47 +1205,13 @@ fn make_entry(record: &FileRecord, path: OsString) -> Entry {
     if attributes == 0 {
         attributes = FILE_ATTRIBUTE_NORMAL;
     }
-    Entry {
-        path: PathBuf::from(path),
+    Meta {
         is_dir: record.is_dir,
         size: (!record.is_dir).then(|| record.data_size.or(record.name_size).unwrap_or(0)),
         modified: record.times.map(|times| times.modified),
         created: record.times.map(|times| times.created),
         attributes: Some(attributes),
     }
-}
-
-/// `parent` + separator + `name`, built with one exact-size allocation for
-/// valid Unicode names.
-fn join(parent: &OsStr, name: &[u16]) -> OsString {
-    let separator = !matches!(parent.as_encoded_bytes().last(), Some(b'\\' | b'/'));
-    if let Some(parent) = parent.to_str() {
-        let length: Option<usize> = char::decode_utf16(name.iter().copied())
-            .map(|unit| unit.ok().map(char::len_utf8))
-            .sum();
-        if let Some(length) = length {
-            let mut path = String::with_capacity(parent.len() + usize::from(separator) + length);
-            path.push_str(parent);
-            if separator {
-                path.push(std::path::MAIN_SEPARATOR);
-            }
-            path.extend(char::decode_utf16(name.iter().copied()).map(|unit| unit.unwrap_or('\u{FFFD}')));
-            return path.into();
-        }
-    }
-    // Names with unpaired surrogates keep them on Windows.
-    let mut path = OsString::from(parent);
-    if separator {
-        path.push(std::path::MAIN_SEPARATOR_STR);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStringExt;
-        path.push(OsString::from_wide(name));
-    }
-    #[cfg(not(windows))]
-    path.push(String::from_utf16_lossy(name));
-    path
 }
 
 fn round_up(value: u64, multiple: u64) -> u64 {
@@ -1249,6 +1233,7 @@ fn le_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn data_runs_decode_relative_and_sparse_offsets() {
@@ -1331,13 +1316,14 @@ mod tests {
     #[test]
     #[ignore = "needs an NTFS image"]
     fn image_matches_directory_walk() {
-        let image = PathBuf::from(std::env::var_os("EVERYRUST_NTFS_IMAGE").unwrap());
-        let mount = PathBuf::from(std::env::var_os("EVERYRUST_NTFS_MOUNT").unwrap());
+        let image = std::path::PathBuf::from(std::env::var_os("EVERYRUST_NTFS_IMAGE").unwrap());
+        let mount = std::path::PathBuf::from(std::env::var_os("EVERYRUST_NTFS_MOUNT").unwrap());
         let started = std::time::Instant::now();
         let readers = std::env::var("EVERYRUST_MFT_READERS").map_or(8, |value| value.parse().unwrap());
         let block_bytes = std::env::var("EVERYRUST_MFT_BLOCK_KIB").map_or(DEFAULT_BLOCK_BYTES, |kib| kib.parse::<u64>().unwrap() << 10);
-        let (from_mft, report) = read_volume(|| std::fs::File::open(&image), readers, block_bytes, &mount).unwrap();
+        let (nodes, report) = read_volume(|| std::fs::File::open(&image), readers, block_bytes, &mount).unwrap();
         eprintln!("{report}");
+        let from_mft = crate::index::SearchIndex::from_nodes(nodes, true).entries();
         let mft_time = started.elapsed();
         let started = std::time::Instant::now();
         let from_walk = crate::scan::scan(&mount).unwrap();
@@ -1350,7 +1336,7 @@ mod tests {
                 .all(|pair| crate::search::compare_paths(&pair[0].path, &pair[1].path).is_lt()),
             "MFT entries are not in path order"
         );
-        let key = |entry: &Entry| (entry.path.clone(), entry.is_dir, entry.size, entry.modified);
+        let key = |entry: &crate::model::Entry| (entry.path.clone(), entry.is_dir, entry.size, entry.modified);
         let mut mft: Vec<_> = from_mft.iter().map(key).collect();
         let mut walk: Vec<_> = from_walk.iter().map(key).collect();
         mft.sort();

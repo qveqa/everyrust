@@ -22,6 +22,7 @@ use everyrust::efu;
 use everyrust::model::Entry;
 use everyrust::scan;
 use everyrust::search::{self, Query, SearchIndex, SearchOptions, SortKey};
+use everyrust::usn::JournalState;
 use everyrust::timeutil;
 
 /// mimalloc is much faster than the system allocator for the millions of
@@ -100,7 +101,6 @@ struct App {
     index: Option<SearchIndex>,
     hits: Vec<usize>,
     result_order: Vec<usize>,
-    path_order: Vec<usize>,
     deleted_files: HashSet<PathBuf>,
     watch: Option<live::Watch>,
     live_warning: Option<String>,
@@ -119,10 +119,12 @@ struct App {
     receiver: Option<Receiver<ScanMessage>>,
     /// Whether the index on screen comes from the saved index file.
     showing_saved: bool,
-    /// How the last scan went, for the status bar.
-    scan_note: Option<String>,
-    /// Why the MFT could not be read, or where the scan time went; shown as a tooltip.
-    scan_tooltip: Option<String>,
+    /// The saved index file and the root it belongs to.
+    saved_file: Option<(PathBuf, PathBuf)>,
+    /// The change journal position the index matches.
+    journal: Option<JournalState>,
+    /// Whether the index changed since it was saved.
+    dirty: bool,
     status_error: Option<String>,
     unreadable: usize,
     elevated: bool,
@@ -143,25 +145,16 @@ enum ScanMessage {
     Done(Result<IndexedScan, String>),
 }
 
-/// What a source loader reports besides the entries.
-#[derive(Default)]
-struct LoadInfo {
-    unreadable: usize,
-    method: &'static str,
-    mft_error: Option<String>,
-    /// Timing details shown next to the method.
-    details: Option<String>,
-}
-
 struct IndexedScan {
     index: SearchIndex,
-    info: LoadInfo,
-    took: Duration,
+    unreadable: usize,
     order: Vec<usize>,
     sort: (SortKey, bool),
-    path_order: Vec<usize>,
     watch: Option<live::Watch>,
     warning: Option<String>,
+    journal: Option<JournalState>,
+    /// Whether the index differs from the saved file.
+    dirty: bool,
 }
 
 impl App {
@@ -173,7 +166,6 @@ impl App {
             index: None,
             hits: Vec::new(),
             result_order: Vec::new(),
-            path_order: Vec::new(),
             deleted_files: HashSet::new(),
             watch: None,
             live_warning: None,
@@ -191,8 +183,9 @@ impl App {
             scanning: false,
             receiver: None,
             showing_saved: false,
-            scan_note: None,
-            scan_tooltip: None,
+            saved_file: None,
+            journal: None,
+            dirty: false,
             status_error: None,
             unreadable: 0,
             elevated: is_elevated(),
@@ -222,19 +215,56 @@ impl App {
     fn start_scan(&mut self, root: PathBuf, ctx: &egui::Context) {
         let root = std::path::absolute(&root).unwrap_or(root);
         self.last_scan_source = Some(root.clone());
-        let roots = vec![root.clone()];
-        let saved = saved_index_file(&root).map(|file| (file, root.clone()));
-        self.start_indexing(ctx, roots, saved, move || {
-            scan::scan_with_stats(&root).map(|(entries, stats)| {
-                let info = LoadInfo {
-                    unreadable: stats.unreadable,
-                    method: if stats.used_mft { "MFT" } else { "folder walk" },
-                    mft_error: stats.mft_error,
-                    details: stats.mft_report.map(|report| report.to_string()),
-                };
-                (entries, info)
-            })
-        });
+        self.saved_file = saved_index_file(&root).map(|file| (file, root.clone()));
+        let saved_file = self.saved_file.clone();
+        let show_saved = self.index.is_none();
+        self.start_indexing(move |sort, ctx, sender| {
+            let mut saved = None;
+            if let Some((file, root)) = saved_file.as_ref().filter(|_| show_saved) {
+                saved = everyrust::cache::load(file, root).ok();
+            }
+            // An index from the MFT only needs the changes from the journal.
+            if let Some(saved) = saved.as_mut() {
+                if let Some(scan) = catch_up(&root, saved, sort, ctx) {
+                    let _ = sender.send(ScanMessage::Done(Ok(scan)));
+                    return;
+                }
+            }
+            if let Some(saved) = saved {
+                let scan = build_scan(saved.index, 0, sort, None, None, None, false);
+                if sender.send(ScanMessage::Saved(scan)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+            // Watch folders from the start, so no change during the walk is lost.
+            // Drives read from the MFT use the change journal instead.
+            let drive = everyrust::mft::drive_root_letter(&root).filter(|_| cfg!(windows));
+            let (mut watch, mut warning) = match drive {
+                Some(_) => (None, None),
+                None => live::Watch::start(std::slice::from_ref(&root), ctx.clone()),
+            };
+            let (index, stats) = match scan::scan_index(&root) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = sender.send(ScanMessage::Done(Err(format!("{error:#}"))));
+                    return;
+                }
+            };
+            if drive.is_some() {
+                (watch, warning) = start_watch(&root, stats.journal, ctx);
+            }
+            let journal = stats.journal.filter(|_| watch.as_ref().is_some_and(live::Watch::is_journal));
+            let bytes = saved_file.as_ref().map(|(_, root)| everyrust::cache::encode(root, &index, journal));
+            let scan = build_scan(index, stats.unreadable, sort, watch, warning, journal, false);
+            if sender.send(ScanMessage::Done(Ok(scan))).is_ok() {
+                ctx.request_repaint();
+            }
+            if let (Some((file, _)), Some(bytes)) = (&saved_file, bytes) {
+                // The index works without the file; it only speeds up the next start.
+                let _ = everyrust::cache::save(file, &bytes);
+            }
+        }, ctx);
     }
 
     /// Indexes drive `C:\` when no folder is given on the command line.
@@ -247,26 +277,21 @@ impl App {
 
     fn start_load_file_list(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.last_scan_source = Some(path.clone());
-        self.start_indexing(ctx, Vec::new(), None, move || {
-            efu::read_file_list(&path).map(|entries| {
-                let info = LoadInfo {
-                    method: "file list",
-                    ..LoadInfo::default()
-                };
-                (entries, info)
-            })
-        });
+        self.saved_file = None;
+        self.start_indexing(move |sort, _ctx, sender| {
+            let result = efu::read_file_list(&path)
+                .map(|entries| build_scan(SearchIndex::new(entries, false), 0, sort, None, None, None, false))
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(ScanMessage::Done(result));
+        }, ctx);
     }
 
-    /// Loads a source on a background thread. With `saved` (the index file
-    /// and its root), the saved index is shown first when nothing is on screen
-    /// yet, and the fresh index is saved when the scan finishes.
+    /// Runs `load` on a background thread. It sends the saved index, if any,
+    /// and then the fresh one.
     fn start_indexing(
         &mut self,
+        load: impl FnOnce((SortKey, bool), &egui::Context, &mpsc::Sender<ScanMessage>) + Send + 'static,
         ctx: &egui::Context,
-        roots: Vec<PathBuf>,
-        saved: Option<(PathBuf, PathBuf)>,
-        load: impl FnOnce() -> anyhow::Result<(Vec<Entry>, LoadInfo)> + Send + 'static,
     ) {
         self.watch = None;
         self.deleted_files.clear();
@@ -275,49 +300,13 @@ impl App {
         self.status_error = None;
         self.unreadable = 0;
         self.selected = None;
-        let show_saved = self.index.is_none();
+        self.journal = None;
         let sort = (self.sort, self.descending);
         let ctx = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let started = Instant::now();
-            if let Some((file, root)) = saved.as_ref().filter(|_| show_saved) {
-                if let Ok(entries) = everyrust::cache::load(file, root) {
-                    let info = LoadInfo {
-                        method: "saved index",
-                        ..LoadInfo::default()
-                    };
-                    let scan = build_scan(entries, info, sort, None, None, started.elapsed());
-                    if sender.send(ScanMessage::Saved(scan)).is_err() {
-                        return;
-                    }
-                    ctx.request_repaint();
-                }
-            }
-            let (watch, warning) = if roots.is_empty() {
-                (None, None)
-            } else {
-                live::Watch::start(&roots, ctx.clone())
-            };
-            let started = Instant::now();
-            let mut bytes = None;
-            let result = load()
-                .map(|(entries, info)| {
-                    // Measure the scan alone, without saving the index.
-                    let took = started.elapsed();
-                    if let Some((_, root)) = &saved {
-                        bytes = Some(everyrust::cache::encode(root, &entries));
-                    }
-                    build_scan(entries, info, sort, watch, warning, took)
-                })
-                .map_err(|error| format!("{error:#}"));
-            if sender.send(ScanMessage::Done(result)).is_ok() {
-                ctx.request_repaint();
-            }
-            if let (Some((file, _)), Some(bytes)) = (&saved, bytes) {
-                // The index works without the file; it only speeds up the next start.
-                let _ = everyrust::cache::save(file, &bytes);
-            }
+            load(sort, &ctx, &sender);
+            ctx.request_repaint();
         });
         self.receiver = Some(receiver);
     }
@@ -353,7 +342,7 @@ impl App {
     }
 
     fn show_scan(&mut self, scan: IndexedScan) {
-        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        let selected_path = self.selected_entry().map(|entry| entry.path);
         self.hits.clear();
         self.selected = None;
         self.date_labels.clear();
@@ -362,26 +351,18 @@ impl App {
             std::thread::spawn(move || drop(previous));
         }
         self.result_order = scan.order;
-        self.path_order = scan.path_order;
         self.watch = scan.watch;
         self.live_warning = scan.warning;
         self.order_sort = scan.sort;
-        self.unreadable = scan.info.unreadable;
-        self.scan_note = Some(format!(
-            "{} in {:.2} s ({})",
-            if scan.info.method == "saved index" { "loaded" } else { "indexed" },
-            scan.took.as_secs_f64(),
-            scan.info.method,
-        ));
-        self.scan_tooltip = match (scan.info.details, scan.info.mft_error) {
-            (Some(details), _) => Some(format!("MFT: {details}")),
-            (None, Some(error)) => Some(format!("MFT unavailable: {error}")),
-            (None, None) => None,
-        };
+        self.unreadable = scan.unreadable;
+        self.journal = scan.journal;
+        self.dirty = scan.dirty;
         self.recompute();
         // Keep the selection when the fresh index replaces the saved one.
-        if let (Some(path), Some(index)) = (selected_path, &self.index) {
-            self.selected = self.hits.iter().position(|&hit| index.entry(hit).path == path);
+        if let (Some(path), Some(index)) = (selected_path, self.index.as_mut()) {
+            if let Some(id) = index.find(&path) {
+                self.selected = self.hits.iter().position(|&hit| hit == id);
+            }
         }
     }
 
@@ -390,9 +371,14 @@ impl App {
             return;
         };
         let mut changes = HashMap::new();
+        let mut journal_changes = Vec::new();
         while let Ok(update) = watch.poll() {
             match update {
                 live::Update::Paths(paths) => changes.extend(paths),
+                live::Update::Journal(batch, state) => {
+                    journal_changes.extend(batch);
+                    self.journal = Some(state);
+                }
                 live::Update::Warning(warning) => self.live_warning = Some(warning),
                 live::Update::Rescan => {
                     self.pending = Some(Action::Reindex);
@@ -414,32 +400,51 @@ impl App {
             self.deleted_files.remove(path);
             true
         });
-        self.apply_index_changes(changes);
+        if !journal_changes.is_empty() {
+            if let Some(index) = self.index.as_mut() {
+                let applied = everyrust::usn::apply(index, journal_changes, |path| path.symlink_metadata().is_ok());
+                self.apply_changes(applied);
+            }
+        }
+        if !changes.is_empty() {
+            if let Some(index) = self.index.as_mut() {
+                let applied = live::apply_paths(index, changes);
+                self.apply_changes(applied);
+            }
+        }
     }
 
-    fn apply_index_changes(&mut self, changes: HashMap<PathBuf, Option<Entry>>) {
-        if changes.is_empty() {
+    /// Updates the result order and the view after index changes.
+    fn apply_changes(&mut self, applied: everyrust::usn::Applied) {
+        if applied.is_empty() {
             return;
         }
-        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
-        let Some(index) = self.index.as_mut() else {
+        self.dirty = true;
+        let selected_id = self.selected.and_then(|row| self.hits.get(row)).copied();
+        let Some(index) = self.index.as_ref() else {
             return;
         };
-        if !live::apply(
-            index,
-            &mut self.path_order,
-            &mut self.result_order,
-            self.order_sort,
-            changes,
-        ) {
-            return;
-        }
+        live::update_order(index, &mut self.result_order, self.order_sort, &applied);
         self.selected = None;
         self.hits.clear();
         self.recompute();
-        if let (Some(path), Some(index)) = (selected_path, &self.index) {
-            self.selected = live::find(index, &self.path_order, &path)
-                .and_then(|id| self.hits.iter().position(|&hit| hit == id));
+        if let (Some(id), Some(index)) = (selected_id, &self.index) {
+            if index.is_live(id) {
+                self.selected = self.hits.iter().position(|&hit| hit == id);
+            }
+        }
+    }
+
+    /// Saves the index when it changed, so the next start can use it.
+    fn save_index(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let (Some((file, root)), Some(index)) = (&self.saved_file, &self.index) {
+            let bytes = everyrust::cache::encode(root, index, self.journal);
+            if everyrust::cache::save(file, &bytes).is_ok() {
+                self.dirty = false;
+            }
         }
     }
 
@@ -464,8 +469,7 @@ impl App {
         let sort = (self.sort, self.descending);
         if self.order_sort != sort {
             // Rebuild from index order to keep ties stable as sort keys change.
-            self.result_order.clear();
-            self.result_order.extend(0..index.len());
+            self.result_order = index.ids();
             search::sort_hits(index, &mut self.result_order, sort.0, sort.1);
             self.order_sort = sort;
         }
@@ -491,7 +495,7 @@ impl App {
         self.scroll_to_selection = true;
     }
 
-    fn selected_entry(&self) -> Option<&Entry> {
+    fn selected_entry(&self) -> Option<Entry> {
         let index = self.index.as_ref()?;
         let position = self.selected?;
         let entry_index = *self.hits.get(position)?;
@@ -609,17 +613,13 @@ impl App {
                 return;
             }
         }
-        // Imported lists build the path order on demand.
-        if let Some(index) = &self.index {
-            if self.path_order.is_empty() {
-                self.path_order.extend(0..index.len());
-                search::sort_hits(index, &mut self.path_order, SortKey::Path, false);
-            }
-        }
-        if self.watch.is_some() {
+        if self.watch.as_ref().is_some_and(|watch| !watch.is_journal()) {
             self.deleted_files.insert(path.clone());
         }
-        self.apply_index_changes(HashMap::from([(path, None)]));
+        if let Some(index) = self.index.as_mut() {
+            let applied = live::apply_paths(index, HashMap::from([(path, None)]));
+            self.apply_changes(applied);
+        }
     }
 
     fn actions_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -709,7 +709,7 @@ impl App {
                     if let Some(index) = &self.index {
                         let mut text = String::new();
                         for hit in &self.hits {
-                            text.push_str(&index.entry(*hit).path.display().to_string());
+                            text.push_str(&index.path(*hit).display().to_string());
                             text.push('\n');
                         }
                         if let Err(error) = std::fs::write(&file, text) {
@@ -837,12 +837,6 @@ impl eframe::App for App {
                         ui.spinner();
                         ui.weak(if self.showing_saved { "Updating…" } else { "Scanning…" });
                     }
-                    if let Some(note) = &self.scan_note {
-                        let label = ui.weak(format!("· {note}"));
-                        if let Some(tooltip) = &self.scan_tooltip {
-                            label.on_hover_text(tooltip);
-                        }
-                    }
                     if let Some(entry) = self.selected_entry() {
                         if let Some(bytes) = entry.size.filter(|_| !entry.is_dir) {
                             ui.separator();
@@ -857,7 +851,7 @@ impl eframe::App for App {
                         }
                         ui.separator();
                         ui.add(
-                            egui::Label::new(format!("Path: {}", status_folder(entry))).truncate(),
+                            egui::Label::new(format!("Path: {}", status_folder(&entry))).truncate(),
                         );
                     }
                 });
@@ -979,6 +973,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.watch = None;
         self.receiver = None;
+        self.save_index();
     }
 }
 
@@ -1277,7 +1272,7 @@ fn draw_table(
                     );
                     let icon_rect = icon_rect.round_to_pixels(ui.pixels_per_point());
                     let opacity = if is_selected { 135 } else { 255 };
-                    if let Some(texture) = icons.texture_id(ui.ctx(), entry) {
+                    if let Some(texture) = icons.texture_id(ui.ctx(), &entry) {
                         ui.painter().image(
                             texture,
                             icon_rect,
@@ -1291,7 +1286,7 @@ fn draw_table(
                     let mut x = rect.left();
                     let values = [
                         entry.name_string(),
-                        containing_folder(entry).display().to_string(),
+                        containing_folder(&entry).display().to_string(),
                         human_size(entry.size, entry.is_dir),
                         entry
                             .modified
@@ -1554,35 +1549,78 @@ fn local_datetime(filetime: u64) -> String {
     }
 }
 
-/// Builds the index and the initial orders for a loaded source.
+/// Builds the initial result order for a loaded index.
 fn build_scan(
-    entries: Vec<Entry>,
-    info: LoadInfo,
+    index: SearchIndex,
+    unreadable: usize,
     sort: (SortKey, bool),
     watch: Option<live::Watch>,
     warning: Option<String>,
-    took: Duration,
+    journal: Option<JournalState>,
+    dirty: bool,
 ) -> IndexedScan {
-    let index = SearchIndex::new(entries, true);
-    let mut order: Vec<usize> = (0..index.len()).collect();
+    let mut order = index.ids();
     search::sort_hits(&index, &mut order, sort.0, sort.1);
-    let path_order = if watch.is_some() {
-        let mut paths: Vec<usize> = (0..index.len()).collect();
-        search::sort_hits(&index, &mut paths, SortKey::Path, false);
-        paths
-    } else {
-        Vec::new()
-    };
     IndexedScan {
         index,
-        info,
-        took,
+        unreadable,
         order,
         sort,
-        path_order,
         watch,
         warning,
+        journal,
+        dirty,
     }
+}
+
+/// Brings a saved MFT index up to date from the change journal. `None` when
+/// the journal cannot be used; then the caller scans again.
+#[cfg(windows)]
+fn catch_up(
+    root: &Path,
+    saved: &mut everyrust::cache::Saved,
+    sort: (SortKey, bool),
+    ctx: &egui::Context,
+) -> Option<IndexedScan> {
+    let state = saved.journal?;
+    if !saved.index.has_records() {
+        return None;
+    }
+    let letter = everyrust::mft::drive_root_letter(root)?;
+    let journal = everyrust::usn::Journal::open(letter).ok()?;
+    let (changes, state) = journal.read(state).ok()?;
+    let index = std::mem::replace(&mut saved.index, SearchIndex::new(Vec::new(), false));
+    let mut index = index;
+    let applied = everyrust::usn::apply(&mut index, changes, |path| path.symlink_metadata().is_ok());
+    let watch = live::Watch::journal(journal, state, ctx.clone());
+    Some(build_scan(index, 0, sort, Some(watch), None, Some(state), !applied.is_empty()))
+}
+
+#[cfg(not(windows))]
+fn catch_up(
+    _root: &Path,
+    _saved: &mut everyrust::cache::Saved,
+    _sort: (SortKey, bool),
+    _ctx: &egui::Context,
+) -> Option<IndexedScan> {
+    None
+}
+
+/// Live updates after a full scan of a drive: the change journal when the
+/// MFT was read, else file system notifications.
+#[cfg(windows)]
+fn start_watch(root: &Path, journal: Option<JournalState>, ctx: &egui::Context) -> (Option<live::Watch>, Option<String>) {
+    if let (Some(state), Some(letter)) = (journal, everyrust::mft::drive_root_letter(root)) {
+        if let Ok(journal) = everyrust::usn::Journal::open(letter) {
+            return (Some(live::Watch::journal(journal, state, ctx.clone())), None);
+        }
+    }
+    live::Watch::start(&[root.to_path_buf()], ctx.clone())
+}
+
+#[cfg(not(windows))]
+fn start_watch(root: &Path, _journal: Option<JournalState>, ctx: &egui::Context) -> (Option<live::Watch>, Option<String>) {
+    live::Watch::start(&[root.to_path_buf()], ctx.clone())
 }
 
 /// Where the index of `root` is saved between runs, or `None` when saving
