@@ -24,6 +24,11 @@ use everyrust::scan;
 use everyrust::search::{self, Query, SearchIndex, SearchOptions, SortKey};
 use everyrust::timeutil;
 
+/// mimalloc is much faster than the system allocator for the millions of
+/// small strings an index holds, especially when threads allocate at once.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[path = "gui/live.rs"]
 mod live;
 
@@ -273,7 +278,10 @@ impl App {
                 self.hits.clear();
                 self.selected = None;
                 self.date_labels.clear();
-                self.index = Some(scan.index);
+                // Freeing millions of entries takes a while; keep the UI responsive.
+                if let Some(previous) = self.index.replace(scan.index) {
+                    std::thread::spawn(move || drop(previous));
+                }
                 self.result_order = scan.order;
                 self.path_order = scan.path_order;
                 self.watch = scan.watch;

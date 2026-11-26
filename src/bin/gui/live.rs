@@ -149,7 +149,7 @@ fn resolve(paths: HashMap<PathBuf, bool>) -> HashMap<PathBuf, Option<Entry>> {
 
 pub fn find(index: &SearchIndex, order: &[usize], path: &Path) -> Option<usize> {
     order
-        .binary_search_by(|&id| index.entry(id).path.as_path().cmp(path))
+        .binary_search_by(|&id| search::compare_paths(&index.entry(id).path, path))
         .ok()
         .map(|row| order[row])
 }
@@ -177,7 +177,9 @@ pub fn apply(
                 }
             }
             None => {
-                let start = path_order.partition_point(|&id| index.entry(id).path < path);
+                let start = path_order.partition_point(|&id| {
+                    search::compare_paths(&index.entry(id).path, &path) == std::cmp::Ordering::Less
+                });
                 removed.extend(
                     path_order[start..].iter().copied()
                         .take_while(|&id| index.entry(id).path.starts_with(&path)),

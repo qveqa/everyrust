@@ -2,11 +2,13 @@
 //!
 //! - [`efu`] reads and writes EFU, CSV, and plain-text file lists.
 //! - [`model`] defines indexed metadata.
+//! - [`mft`] reads the NTFS Master File Table for fast drive indexing.
 //! - [`scan`] walks directories.
 //! - [`search`] builds indexes, filters queries, and sorts results.
 //! - [`timeutil`] converts file timestamps.
 
 pub mod efu;
+pub mod mft;
 pub mod model;
 pub mod scan;
 pub mod search;

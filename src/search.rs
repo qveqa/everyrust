@@ -12,6 +12,7 @@
 //! - `--whole-word` requires word boundaries around literal terms.
 
 use std::cmp::Ordering;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
@@ -118,6 +119,9 @@ pub struct SearchIndex {
     names: Vec<String>,
     names_lower: Vec<String>,
     paths: Option<OnceLock<(Vec<String>, Vec<String>)>>,
+    /// Whether `entries` are in [`compare_paths`] order. Then the entry index
+    /// replaces the path as the tie-break, which makes sorting much cheaper.
+    path_sorted: bool,
 }
 
 impl SearchIndex {
@@ -132,12 +136,21 @@ impl SearchIndex {
                 (name, lower)
             })
             .unzip();
+        let path_sorted = entries
+            .par_windows(2)
+            .all(|pair| compare_paths(&pair[0].path, &pair[1].path) != Ordering::Greater);
         Self {
             entries,
             names,
             names_lower,
             paths: need_paths.then(OnceLock::new),
+            path_sorted,
         }
+    }
+
+    /// Whether entry indexes follow the path order.
+    pub fn is_path_sorted(&self) -> bool {
+        self.path_sorted
     }
 
     pub fn len(&self) -> usize {
@@ -162,6 +175,7 @@ impl SearchIndex {
 
     pub fn replace_entry(&mut self, index: usize, entry: Entry) {
         if entry.path.as_os_str() != self.entries[index].path.as_os_str() {
+            self.path_sorted = false;
             let name = entry.name_string();
             self.names_lower[index] = name.to_lowercase();
             self.names[index] = name;
@@ -175,6 +189,10 @@ impl SearchIndex {
     }
 
     pub fn push_entry(&mut self, entry: Entry) {
+        self.path_sorted &= self
+            .entries
+            .last()
+            .is_none_or(|last| compare_paths(&last.path, &entry.path) != Ordering::Greater);
         let name = entry.name_string();
         self.names_lower.push(name.to_lowercase());
         self.names.push(name);
@@ -187,6 +205,8 @@ impl SearchIndex {
     }
 
     pub fn swap_remove_entry(&mut self, index: usize) {
+        // Moving the last entry into the hole breaks the path order.
+        self.path_sorted &= index + 1 == self.entries.len();
         self.entries.swap_remove(index);
         self.names.swap_remove(index);
         self.names_lower.swap_remove(index);
@@ -297,8 +317,111 @@ fn filter_indices(
 
 /// Sorts hit indexes according to `sort`; ties break by path so the order is
 /// deterministic across runs.
+///
+/// Each hit gets a numeric sort key first. Most comparisons then use only that
+/// key, which avoids reading the entries and keeps the sort cache-friendly.
 pub fn sort_hits(index: &SearchIndex, hits: &mut [usize], sort: SortKey, descending: bool) {
-    hits.par_sort_by(|&a, &b| compare_entries(index, a, b, sort, descending));
+    let direct = |ordering: Ordering| if descending { ordering.reverse() } else { ordering };
+    if sort == SortKey::Path {
+        if index.is_path_sorted() {
+            // Index order is path order.
+            hits.par_sort_unstable_by(|a, b| direct(a.cmp(b)));
+        } else {
+            hits.par_sort_unstable_by(|&a, &b| direct(path_tie_break(index, a, b)).then_with(|| a.cmp(&b)));
+        }
+        return;
+    }
+    let mut keyed: Vec<(u128, usize)> = hits
+        .par_iter()
+        .map(|&hit| (sort_key(index, hit, sort, descending), hit))
+        .collect();
+    keyed.par_sort_unstable_by(|&(left_key, a), &(right_key, b)| {
+        left_key.cmp(&right_key).then_with(|| {
+            let tie = match sort {
+                SortKey::Name => index.name_lower(a).cmp(index.name_lower(b)),
+                _ => Ordering::Equal,
+            };
+            direct(tie.then_with(|| path_tie_break(index, a, b))).then_with(|| a.cmp(&b))
+        })
+    });
+    hits.par_iter_mut()
+        .zip(keyed.par_iter())
+        .for_each(|(hit, &(_, sorted))| *hit = sorted);
+}
+
+/// Compares two entries by path, using the entry index when it is equivalent.
+fn path_tie_break(index: &SearchIndex, a: usize, b: usize) -> Ordering {
+    if index.is_path_sorted() {
+        a.cmp(&b)
+    } else {
+        compare_paths(&index.entry(a).path, &index.entry(b).path)
+    }
+}
+
+/// A key whose ascending order matches [`compare_entries`] up to its tie-break.
+fn sort_key(index: &SearchIndex, entry_index: usize, sort: SortKey, descending: bool) -> u128 {
+    let entry = index.entry(entry_index);
+    let direct = |value: u64| u128::from(if descending { !value } else { value });
+    match sort {
+        // Directories and unknown sizes come last in both directions.
+        SortKey::Size => match entry.size.filter(|_| !entry.is_dir) {
+            Some(size) => direct(size),
+            None => 1 << 64,
+        },
+        SortKey::Modified => direct(entry.modified.unwrap_or(0)),
+        SortKey::Name => {
+            // The first eight bytes, zero-padded, order like the whole name.
+            let mut prefix = [0; 8];
+            let name = index.name_lower(entry_index).as_bytes();
+            let length = name.len().min(8);
+            prefix[..length].copy_from_slice(&name[..length]);
+            direct(u64::from_be_bytes(prefix))
+        }
+        SortKey::Path => 0,
+    }
+}
+
+/// Orders paths component by component, like `Path::cmp` does for normalized
+/// paths, but works on the raw bytes. A separator sorts before every other
+/// byte, so a folder is followed directly by everything inside it. Unlike
+/// `Path::cmp`, drive letters compare by case.
+pub fn compare_paths(left: &Path, right: &Path) -> Ordering {
+    let left = left.as_os_str().as_encoded_bytes();
+    let right = right.as_os_str().as_encoded_bytes();
+    let mut offset = 0;
+    while let Some(position) = first_difference(&left[offset..], &right[offset..]) {
+        let position = offset + position;
+        let ordering = separator_rank(left[position]).cmp(&separator_rank(right[position]));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+        // `/` and `\` are the same separator; keep comparing after it.
+        offset = position + 1;
+    }
+    left.len().cmp(&right.len())
+}
+
+fn separator_rank(byte: u8) -> u16 {
+    if std::path::is_separator(char::from(byte)) {
+        0
+    } else {
+        u16::from(byte) + 1
+    }
+}
+
+/// Index of the first differing byte within the shorter length.
+fn first_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+    let length = left.len().min(right.len());
+    let mut offset = 0;
+    while offset + 8 <= length {
+        let a = u64::from_le_bytes(left[offset..offset + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(right[offset..offset + 8].try_into().unwrap());
+        if a != b {
+            return Some(offset + ((a ^ b).trailing_zeros() / 8) as usize);
+        }
+        offset += 8;
+    }
+    (offset..length).find(|&position| left[position] != right[position])
 }
 
 /// Inserts new or changed entries into an existing sorted order.
@@ -333,7 +456,7 @@ fn compare_entries(
     let right = index.entry(b);
     let ordering = match sort {
         SortKey::Name => index.name_lower(a).cmp(index.name_lower(b)),
-        SortKey::Path => left.path.cmp(&right.path),
+        SortKey::Path => path_tie_break(index, a, b),
         SortKey::Size => {
             let left_size = left.size.filter(|_| !left.is_dir);
             let right_size = right.size.filter(|_| !right.is_dir);
@@ -345,7 +468,7 @@ fn compare_entries(
         }
         SortKey::Modified => left.modified.unwrap_or(0).cmp(&right.modified.unwrap_or(0)),
     };
-    let ordering = ordering.then_with(|| left.path.cmp(&right.path));
+    let ordering = ordering.then_with(|| path_tie_break(index, a, b));
     if descending {
         ordering.reverse()
     } else {
@@ -615,6 +738,48 @@ mod tests {
             filter_ordered_indices(&index, &query, &order),
             search_indices(&index, &query, sort, true, None),
         );
+    }
+
+    #[test]
+    fn path_order_matches_components_and_sorted_indexes_agree() {
+        let paths = ["/a b", "/a/x", "/a", "/ab", "/a/x/y", "/a-b/c", "/"];
+        let mut sorted: Vec<&Path> = paths.iter().map(Path::new).collect();
+        sorted.sort_by(|a, b| compare_paths(a, b));
+        let mut expected: Vec<&Path> = paths.iter().map(Path::new).collect();
+        expected.sort();
+        assert_eq!(sorted, expected);
+
+        let mut files = entries(&["/d/b", "/d/a", "/c", "/d", "/a"]);
+        files[0].size = Some(5);
+        files[3].is_dir = true;
+        let shuffled = SearchIndex::new(files.clone(), false);
+        assert!(!shuffled.is_path_sorted());
+        files.sort_by(|a, b| compare_paths(&a.path, &b.path));
+        let ordered = SearchIndex::new(files, false);
+        assert!(ordered.is_path_sorted());
+        for sort in [SortKey::Name, SortKey::Path, SortKey::Size, SortKey::Modified] {
+            for descending in [false, true] {
+                let names = |index: &SearchIndex| {
+                    let mut hits: Vec<usize> = (0..index.len()).collect();
+                    sort_hits(index, &mut hits, sort, descending);
+                    hits.iter().map(|&hit| index.entry(hit).path.clone()).collect::<Vec<_>>()
+                };
+                assert_eq!(names(&shuffled), names(&ordered), "{sort:?} {descending}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_separators_compare_like_path_cmp() {
+        let pairs = [(r"C:\a\z", "C:/a/b"), (r"C:\a/b", r"C:/a\b"), (r"C:\a b", "C:/a/b")];
+        for (left, right) in pairs {
+            assert_eq!(
+                compare_paths(Path::new(left), Path::new(right)),
+                Path::new(left).cmp(Path::new(right)),
+                "{left} vs {right}"
+            );
+        }
     }
 
     #[test]

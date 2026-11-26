@@ -9,6 +9,11 @@ use everyrust::model::Entry;
 use everyrust::scan;
 use everyrust::search::{self, SearchIndex, SearchOptions, SortKey};
 
+/// mimalloc is much faster than the system allocator for the millions of
+/// small strings an index holds, especially when threads allocate at once.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const HELP: &str = r#"everyrust — fast local file search
 
 USAGE

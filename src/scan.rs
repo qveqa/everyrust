@@ -4,6 +4,10 @@
 //! directory below it (the root itself is not included). Directories are
 //! scheduled as they are found. Reparse points (junctions, symlinks) are
 //! recorded but not descended into, which keeps the walk cycle-free on Windows.
+//!
+//! On Windows, a drive root such as `C:\` is read from the NTFS Master File
+//! Table instead (see [`crate::mft`]) when the process can open the raw volume.
+//! Set `EVERYRUST_NO_MFT` to always use the directory walk.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +49,10 @@ pub fn scan_with_stats(root: &Path) -> Result<(Vec<Entry>, ScanStats)> {
             vec![entry_with_metadata(root.to_path_buf(), Some(metadata), false)],
             ScanStats::default(),
         ));
+    }
+
+    if let Some(entries) = scan_drive_root(root) {
+        return Ok((entries, ScanStats::default()));
     }
 
     // Walk through an extended-length (`\\?\`) root so files deeper than
@@ -109,6 +117,81 @@ struct ScanBatch {
 }
 
 impl ScanBatch {
+    /// Lists one folder with `FindFirstFileExW`. Large fetches return many
+    /// entries per system call, and the find data already holds the size,
+    /// timestamps, and attributes, so no file is opened.
+    #[cfg(windows)]
+    fn read_dir(
+        &mut self,
+        directory: &Path,
+        debug_scan: bool,
+        mut visit_directory: impl FnMut(PathBuf),
+    ) {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
+            FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+        };
+
+        let mut pattern: Vec<u16> = directory.as_os_str().encode_wide().collect();
+        if pattern.last() != Some(&u16::from(b'\\')) {
+            pattern.push(u16::from(b'\\'));
+        }
+        pattern.extend([u16::from(b'*'), 0]);
+        let mut data = WIN32_FIND_DATAW::default();
+        let handle = unsafe {
+            FindFirstFileExW(
+                pattern.as_ptr(),
+                FindExInfoBasic,
+                (&raw mut data).cast(),
+                FindExSearchNameMatch,
+                std::ptr::null(),
+                FIND_FIRST_EX_LARGE_FETCH,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND as i32) {
+                self.record_error(directory, &error, debug_scan);
+            }
+            return;
+        }
+        let display_directory = strip_extended(directory);
+        loop {
+            let length = data.cFileName.iter().position(|&unit| unit == 0).unwrap_or(data.cFileName.len());
+            let name = &data.cFileName[..length];
+            if name != [u16::from(b'.')] && name != [u16::from(b'.'), u16::from(b'.')] {
+                let name = std::ffi::OsString::from_wide(name);
+                let attributes = data.dwFileAttributes;
+                let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                if is_dir && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                    visit_directory(directory.join(&name));
+                }
+                let filetime = |time: windows_sys::Win32::Foundation::FILETIME| {
+                    u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)
+                };
+                self.entries.push(Entry {
+                    path: display_directory.join(&name),
+                    is_dir,
+                    size: (!is_dir).then(|| u64::from(data.nFileSizeHigh) << 32 | u64::from(data.nFileSizeLow)),
+                    modified: Some(filetime(data.ftLastWriteTime)),
+                    created: Some(filetime(data.ftCreationTime)),
+                    attributes: Some(attributes),
+                });
+            }
+            if unsafe { FindNextFileW(handle, &mut data) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                    self.record_error(directory, &error, debug_scan);
+                }
+                break;
+            }
+        }
+        unsafe { FindClose(handle) };
+    }
+
+    #[cfg(not(windows))]
     fn read_dir(
         &mut self,
         directory: &Path,
@@ -164,13 +247,44 @@ impl ScanBatch {
     }
 }
 
+/// Reads a drive root through its MFT. `None` when the root is not a drive
+/// root or the MFT cannot be read; the caller then walks the directories.
+#[cfg(windows)]
+fn scan_drive_root(root: &Path) -> Option<Vec<Entry>> {
+    if std::env::var_os("EVERYRUST_NO_MFT").is_some() {
+        return None;
+    }
+    let root = std::path::absolute(root).ok()?;
+    crate::mft::drive_root_letter(&root)?;
+    match crate::mft::scan_volume_root(&root) {
+        Ok(entries) => Some(entries),
+        Err(error) => {
+            if std::env::var_os("EVERYRUST_DEBUG_SCAN").is_some() {
+                eprintln!("MFT unavailable for {}: {error:#}", root.display());
+            }
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn scan_drive_root(_root: &Path) -> Option<Vec<Entry>> {
+    None
+}
+
 /// Scans every fixed local drive (e.g. `C:\`, `D:\`) and merges the results.
 pub fn scan_local_drives() -> Result<(Vec<Entry>, ScanStats)> {
-    let directories = local_fixed_drives()
-        .into_iter()
-        .map(|drive| extended_path(&drive))
-        .collect();
-    Ok(scan_directories(directories))
+    let mut entries = Vec::new();
+    let mut walk = Vec::new();
+    for drive in local_fixed_drives() {
+        match scan_drive_root(&drive) {
+            Some(mut drive_entries) => entries.append(&mut drive_entries),
+            None => walk.push(extended_path(&drive)),
+        }
+    }
+    let (mut walked, stats) = scan_directories(walk);
+    entries.append(&mut walked);
+    Ok((entries, stats))
 }
 
 /// The fixed local drives as root paths (`C:\`, `D:\`, ...).

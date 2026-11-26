@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Русский
+
+- Корень диска NTFS (по умолчанию `C:\`) индексируется чтением главной таблицы файлов (MFT) напрямую с тома, как в Everything. Блоки MFT читаются и разбираются параллельно. Обход каталогов остаётся запасным вариантом без прав администратора и для дисков не NTFS. `EVERYRUST_NO_MFT` отключает чтение MFT.
+- На образе NTFS со 141 тыс. записей чтение MFT заняло около 70 мс, а обход каталогов того же образа — от 4,5 до 7,3 с. Замер сделан в Wine, а не в Windows; на реальном диске время зависит от скорости чтения MFT.
+- Обход каталогов использует `FindFirstFileExW` с `FIND_FIRST_EX_LARGE_FETCH`: больше записей за один системный вызов.
+- Записи из MFT идут в порядке путей, поэтому сортировка по пути почти мгновенна, а другие сортировки сравнивают номера записей вместо путей. Сравнение путей работает с байтами. На 1,5 млн записей начальная сортировка по размеру ускорилась с 411 до 37 мс, построение порядка путей — с 1070 до 4 мс.
+- Распределитель памяти mimalloc ускоряет построение индекса и освобождение памяти. Старый индекс после `F5` освобождается в фоновом потоке, поэтому окно не замирает.
+
+### English
+
+- An NTFS drive root (`C:\` by default) is indexed by reading the Master File Table (MFT) directly from the volume, as Everything does. MFT blocks are read and parsed in parallel. The directory walk stays as the fallback without administrator privileges and for drives that are not NTFS. `EVERYRUST_NO_MFT` turns off MFT reading.
+- On an NTFS image with 141,000 entries, reading the MFT took about 70 ms, and walking the directories of the same image took 4.5 to 7.3 s. This was measured in Wine, not Windows; on a real drive the time depends on how fast the MFT can be read.
+- The directory walk uses `FindFirstFileExW` with `FIND_FIRST_EX_LARGE_FETCH`, which returns more entries per system call.
+- MFT entries arrive in path order, so sorting by path is almost instant and other sorts compare entry numbers instead of paths. Path comparison works on bytes. With 1.5 million entries, the initial size sort dropped from 411 ms to 37 ms, and building the path order from 1,070 ms to 4 ms.
+- The mimalloc allocator speeds up index building and freeing memory. After `F5`, the old index is freed on a background thread, so the window does not freeze.
+
 ## 0.2.5
 
 ### Русский

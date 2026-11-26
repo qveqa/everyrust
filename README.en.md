@@ -105,19 +105,30 @@ the GUI executable in the destination folder.
 | File | Responsibility |
 |---|---|
 | [`src/scan.rs`](src/scan.rs) | Parallel directory scanning and metadata collection |
+| [`src/mft.rs`](src/mft.rs) | Reading the NTFS Master File Table (MFT) |
 | [`src/search.rs`](src/search.rs) | In-memory index, query parsing, filtering, and sorting |
 | [`src/efu.rs`](src/efu.rs) | Reading and writing file lists |
 | [`src/bin/gui.rs`](src/bin/gui.rs) | Main window, virtualized results table, and file actions |
 | [`src/bin/gui/live.rs`](src/bin/gui/live.rs) | File monitoring and batched index updates |
 | [`src/main.rs`](src/main.rs) | Command-line interface |
 
-The initial index is built by walking directories. Reparse points such as
-junctions appear in the results, and recursive scans skip their targets.
-Index coverage depends on directory access permissions.
+An NTFS drive root, such as `C:\`, is indexed by reading the Master File
+Table (MFT) directly from the volume, as Everything does. This needs
+administrator privileges and includes files in folders you cannot open. When
+the MFT cannot be read (no administrator privileges, or the drive is not NTFS),
+or when you open a regular folder, the index is built by a parallel directory
+walk with `FindFirstFileExW`. Set the `EVERYRUST_NO_MFT` environment variable
+to turn off MFT reading. An MFT index also contains the files inside folders
+that are reparse points, such as OneDrive cloud folders; the directory walk
+does not enter those folders.
+
+Reparse points such as junctions appear in the results, and recursive scans
+skip their targets. With a directory walk, index coverage depends on directory
+access permissions.
 
 ### Benchmarks
 
-With a warm filesystem cache, the median time to scan, index, and sort the
+These measurements use the directory walk of version 0.2.0. With a warm filesystem cache, the median time to scan, index, and sort the
 initial results for `C:\Windows` (212,000 entries) was 387 ms on the test PC. On an EFU list of
 456,304 entries, filtering and sorting took 72 ms for `*` and 32 ms
 for `*.dll`. Results vary with storage, permissions, and the dataset.
