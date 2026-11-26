@@ -442,6 +442,7 @@ impl App {
         if index.dead_len() > 50_000 && index.dead_len() > index.live_len() {
             let nodes = index.compact();
             let selected_path = selected_id.map(|id| index.path(id));
+            let selected_record = selected_id.and_then(|id| index.record(id));
             *index = SearchIndex::from_nodes(nodes, true);
             self.result_order = index.ids();
             search::sort_hits(index, &mut self.result_order, self.order_sort.0, self.order_sort.1);
@@ -449,7 +450,11 @@ impl App {
             self.selected = None;
             self.recompute();
             if let (Some(path), Some(index)) = (selected_path, self.index.as_mut()) {
-                if let Some(id) = (!index.has_records()).then(|| index.find(&path)).flatten() {
+                let id = match selected_record {
+                    Some(record) => index.nodes_of_record(record).into_iter().find(|&id| index.path(id) == path),
+                    None => index.find(&path),
+                };
+                if let Some(id) = id {
                     self.selected = self.hits.iter().position(|&hit| hit == id);
                 }
             }
