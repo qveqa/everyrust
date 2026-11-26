@@ -115,7 +115,6 @@ struct App {
     status_error: Option<String>,
     unreadable: usize,
     elevated: bool,
-    all_drives: bool,
     dark: bool,
     show_about: bool,
     focus_search: bool,
@@ -166,7 +165,6 @@ impl App {
             status_error: None,
             unreadable: 0,
             elevated: is_elevated(),
-            all_drives: false,
             dark: true,
             show_about: false,
             focus_search: true,
@@ -185,7 +183,7 @@ impl App {
         if let Some(root) = start {
             app.start_scan(root, &cc.egui_ctx);
         } else {
-            app.start_scan_all_drives(&cc.egui_ctx);
+            app.start_scan_default(&cc.egui_ctx);
         }
         app
     }
@@ -193,36 +191,22 @@ impl App {
     fn start_scan(&mut self, root: PathBuf, ctx: &egui::Context) {
         let root = std::path::absolute(&root).unwrap_or(root);
         self.last_scan_source = Some(root.clone());
-        self.all_drives = false;
         let roots = vec![root.clone()];
         self.start_indexing(ctx, roots, move || {
             scan::scan_with_stats(&root).map(|(entries, stats)| (entries, stats.unreadable))
         });
     }
 
-    fn start_scan_all_drives(&mut self, ctx: &egui::Context) {
-        self.all_drives = true;
-        self.last_scan_source = None;
-        let mut roots = scan::local_fixed_drives();
-        let fixed_drives = !roots.is_empty();
-        if !fixed_drives {
-            roots.extend(std::env::var_os("USERPROFILE").map(PathBuf::from));
+    /// Indexes drive `C:\` when no folder is given on the command line.
+    fn start_scan_default(&mut self, ctx: &egui::Context) {
+        match default_scan_root() {
+            Some(root) => self.start_scan(root, ctx),
+            None => self.status_error = Some("Cannot determine a folder to index".to_owned()),
         }
-        let home = roots.first().cloned();
-        self.start_indexing(ctx, roots, move || {
-            let (entries, stats) = if fixed_drives {
-                scan::scan_local_drives()?
-            } else {
-                let home = home.ok_or_else(|| anyhow::anyhow!("cannot determine a folder to index"))?;
-                scan::scan_with_stats(&home)?
-            };
-            Ok((entries, stats.unreadable))
-        });
     }
 
     fn start_load_file_list(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.last_scan_source = Some(path.clone());
-        self.all_drives = false;
         self.start_indexing(ctx, Vec::new(), move || {
             efu::read_file_list(&path).map(|entries| (entries, 0))
         });
@@ -459,7 +443,9 @@ impl App {
                 ctrl && input.key_pressed(Key::F),
                 input.key_pressed(Key::F5),
                 input.key_pressed(Key::Escape),
-                ctrl && input.key_pressed(Key::C),
+                // egui-winit reports Ctrl+C as a Copy event, not as a key press.
+                input.events.iter().any(|event| matches!(event, egui::Event::Copy))
+                    || ctrl && input.key_pressed(Key::C),
                 ctrl && input.key_pressed(Key::O),
             )
         });
@@ -496,7 +482,8 @@ impl App {
             self.record_search();
             self.pending = Some(Action::OpenSelected);
         }
-        if copy {
+        // Text selected in the search box is copied by the text field itself.
+        if copy && !search_field_has_selection(ctx) {
             self.pending = Some(Action::CopySelectedPath);
         }
         if self.pending.is_none()
@@ -637,14 +624,15 @@ impl App {
                             text.push_str(&index.entry(*hit).path.display().to_string());
                             text.push('\n');
                         }
-                        let _ = std::fs::write(&file, text);
+                        if let Err(error) = std::fs::write(&file, text) {
+                            self.status_error =
+                                Some(format!("Could not export to {}: {error}", file.display()));
+                        }
                     }
                 }
             }
             Action::Reindex => {
-                if self.all_drives {
-                    self.start_scan_all_drives(ctx);
-                } else if let Some(source) = self.last_scan_source.clone() {
+                if let Some(source) = self.last_scan_source.clone() {
                     if source.is_dir() {
                         self.start_scan(source, ctx);
                     } else {
@@ -1472,13 +1460,119 @@ fn local_datetime(filetime: u64) -> String {
     }
 }
 
+fn search_field_has_selection(ctx: &egui::Context) -> bool {
+    let id = egui::Id::unique(SEARCH_FIELD_ID);
+    ctx.memory(|memory| memory.has_focus(id))
+        && egui::text_edit::TextEditState::load(ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .is_some_and(|range| !range.is_empty())
+}
+
+/// `C:\` on Windows; the home folder elsewhere or when `C:\` is missing.
+fn default_scan_root() -> Option<PathBuf> {
+    let system_drive = PathBuf::from("C:\\");
+    if cfg!(windows) && system_drive.is_dir() {
+        return Some(system_drive);
+    }
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// Opens a file or folder with its default handler. The path goes to the
+/// Shell as one argument, so characters such as `&` are never run as commands.
+#[cfg(windows)]
 fn open_path(path: &Path) {
-    let _ = std::process::Command::new("cmd")
-        .arg("/C")
-        .arg("start")
-        .arg("")
-        .arg(path)
-        .spawn();
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    std::thread::spawn(move || {
+        use std::ptr::null;
+        use windows_sys::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        };
+
+        // The Shell can use COM for some file handlers.
+        let initialized = unsafe {
+            CoInitializeEx(null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32)
+        } >= 0;
+        shell_execute("open", path.as_os_str(), None);
+        if initialized {
+            unsafe { CoUninitialize() };
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn open_path(path: &Path) {
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Runs `ShellExecuteW`. Returns whether the Shell accepted the request.
+#[cfg(windows)]
+fn shell_execute(operation: &str, file: &std::ffi::OsStr, parameters: Option<&str>) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+
+    let file: Vec<u16> = file.encode_wide().chain(std::iter::once(0)).collect();
+    if file[..file.len() - 1].contains(&0) {
+        return false;
+    }
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
+    let operation = wide(operation);
+    let parameters = parameters.map(wide);
+    let result = unsafe {
+        ShellExecuteW(
+            0,
+            operation.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result > 32
+}
+
+/// Quotes one argument so `CommandLineToArgvW` reads it back unchanged.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty() && !argument.contains([' ', '\t', '\n', '\u{b}', '"']) {
+        return argument.to_owned();
+    }
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in argument.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are escaped, then the quote itself.
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    // Trailing backslashes are doubled so they do not escape the closing quote.
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(windows)]
@@ -1497,58 +1591,16 @@ fn is_elevated() -> bool {
 
 #[cfg(windows)]
 fn relaunch_as_admin(arguments: &[String]) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "shell32")]
-    extern "system" {
-        fn ShellExecuteW(
-            hwnd: isize,
-            lp_operation: *const u16,
-            lp_file: *const u16,
-            lp_parameters: *const u16,
-            lp_directory: *const u16,
-            n_show_cmd: i32,
-        ) -> isize;
-    }
-
     let Ok(executable) = std::env::current_exe() else {
         return false;
     };
-    let quote = |argument: &str| {
-        if argument.contains(' ') {
-            format!("\"{argument}\"")
-        } else {
-            argument.to_owned()
-        }
-    };
-    let parameters_text = arguments
+    let parameters = arguments
         .iter()
         .filter(|argument| argument.as_str() != "--no-elevate")
-        .map(|argument| quote(argument))
+        .map(|argument| quote_windows_argument(argument))
         .collect::<Vec<_>>()
         .join(" ");
-
-    let wide = |text: &str| -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    };
-    let executable_wide: Vec<u16> = executable
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let operation = wide("runas");
-    let parameters = wide(&parameters_text);
-    let result = unsafe {
-        ShellExecuteW(
-            0,
-            operation.as_ptr(),
-            executable_wide.as_ptr(),
-            parameters.as_ptr(),
-            std::ptr::null(),
-            1,
-        )
-    };
-    result > 32
+    shell_execute("runas", executable.as_os_str(), Some(&parameters))
 }
 
 #[cfg(not(windows))]
@@ -2109,5 +2161,16 @@ mod tests {
         assert_eq!(status_size(17), "17 B");
         assert_eq!(status_size(1536), "1,50 KB");
         assert_eq!(status_size(5 << 30), "5,00 GB");
+    }
+
+    #[test]
+    fn windows_arguments_are_quoted_for_command_line_to_argv() {
+        assert_eq!(quote_windows_argument(r"D:\Work"), r"D:\Work");
+        assert_eq!(quote_windows_argument(r"D:\My Work"), r#""D:\My Work""#);
+        assert_eq!(quote_windows_argument(r"D:\My Work\"), r#""D:\My Work\\""#);
+        assert_eq!(quote_windows_argument(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_windows_argument(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote_windows_argument(""), r#""""#);
+        assert_eq!(quote_windows_argument(r"a&b"), r"a&b");
     }
 }

@@ -12,10 +12,9 @@ and the `everyrust` Rust library.
 ## Quick start
 
 Download the Windows x64 archive from **Releases**, extract it, and run
-`everyrust-gui.exe`. The app runs without installation. A prebuilt executable
-in a local project folder is available at `dist/everyrust.exe`.
+`everyrust-gui.exe`. The app runs without installation.
 
-By default, the app scans fixed local drives and requests administrator
+By default, the app scans drive `C:\` and requests administrator
 privileges. To scan a single folder with your current privileges, run this
 PowerShell command from the folder containing the EXE:
 
@@ -34,11 +33,13 @@ monitoring. Bookmarks and search history are kept for the current session.
   first. Drag a header divider to resize the column.
 - Double-click a result to open it. Right-click for **Open Folder** or
   **Copy Path**. Click an empty area to clear the selection.
-- `Ctrl+F` focuses the search box, `Ctrl+C` copies the selected item's full
-  path, and `F5` rescans the current source.
+- `Ctrl+F` focuses the search box, `Ctrl+O` opens a folder, and `F5` rescans
+  the current source. `Enter` opens the selected item, and `Esc` clears the search.
+- `Ctrl+C` copies the selected item's full path. When text is selected in the
+  search box, `Ctrl+C` copies that text instead.
 - `Del` moves the selected file to the Windows Recycle Bin and removes it from the results.
-- Changes to files of any size appear automatically in indexed
-  folders and on local drives. Press `F5` for a full rescan. Imported file
+- Changes to files of any size appear automatically in the indexed
+  folder or drive. Press `F5` for a full rescan. Imported file
   lists are snapshots.
 - The status bar shows the result count, access errors, and details about
   the selected item. The table processes rows that are fully or partially visible.
@@ -116,8 +117,8 @@ Index coverage depends on directory access permissions.
 
 ### Benchmarks
 
-With a warm filesystem cache, scanning and indexing 209,640 entries in
-`C:\Windows` took about 0.66 seconds on the test PC. On an EFU list of
+With a warm filesystem cache, the median time to scan, index, and sort the
+initial results for `C:\Windows` (212,000 entries) was 387 ms on the test PC. On an EFU list of
 456,304 entries, filtering and sorting took 72 ms for `*` and 32 ms
 for `*.dll`. Results vary with storage, permissions, and the dataset.
 

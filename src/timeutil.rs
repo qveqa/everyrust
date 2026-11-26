@@ -9,15 +9,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const WINDOWS_EPOCH_DIFF_SECS: i64 = 11_644_473_600;
 const TICKS_PER_SEC: u64 = 10_000_000;
 
+/// FILETIME of 1970-01-01 00:00:00 UTC.
+const UNIX_EPOCH_TICKS: u64 = WINDOWS_EPOCH_DIFF_SECS as u64 * TICKS_PER_SEC;
+
 /// Converts a `SystemTime` into a FILETIME.
 ///
-/// `None` for times before 1601-01-01 (which cannot be represented).
+/// `None` for times before 1601-01-01 or after the FILETIME range.
 pub fn system_time_to_filetime(time: SystemTime) -> Option<u64> {
-    let unix = time.duration_since(UNIX_EPOCH).ok()?;
-    Some(
-        (unix.as_secs() + WINDOWS_EPOCH_DIFF_SECS as u64) * TICKS_PER_SEC
-            + u64::from(unix.subsec_nanos()) / 100,
-    )
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => {
+            let ticks = u64::try_from(after.as_nanos() / 100).ok()?;
+            UNIX_EPOCH_TICKS.checked_add(ticks)
+        }
+        Err(before) => {
+            // Round toward the past so a time just before 1970 stays before it.
+            let ticks = u64::try_from(before.duration().as_nanos().div_ceil(100)).ok()?;
+            UNIX_EPOCH_TICKS.checked_sub(ticks)
+        }
+    }
 }
 
 /// Converts a FILETIME into Unix seconds (fraction truncated).
@@ -30,6 +39,8 @@ pub fn filetime_to_unix_secs(filetime: u64) -> i64 {
 /// Accepted forms (with optional fractional seconds, `Z` or `±HH:MM` offset):
 /// `YYYY-MM-DDTHH:MM:SS`, `YYYY-MM-DDTHH:MM:SSZ`,
 /// `YYYY-MM-DDTHH:MM:SS+02:00`, `YYYY-MM-DD` (midnight UTC).
+///
+/// `None` for invalid text and for times before 1601-01-01 UTC.
 pub fn parse_iso8601(value: &str) -> Option<u64> {
     let text = value.trim();
     if text.is_empty() {
@@ -61,10 +72,16 @@ pub fn parse_iso8601(value: &str) -> Option<u64> {
         return None;
     }
 
+    // Very large years would overflow the day arithmetic; FILETIME ends in 30828.
+    if !(1..=30_828).contains(&year) {
+        return None;
+    }
     let days = days_from_civil(year, month, day);
     let unix_secs = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_secs;
-    let ticks = (unix_secs + WINDOWS_EPOCH_DIFF_SECS) as u64 * TICKS_PER_SEC + frac_ticks;
-    Some(ticks)
+    let windows_secs = u64::try_from(unix_secs + WINDOWS_EPOCH_DIFF_SECS).ok()?;
+    windows_secs
+        .checked_mul(TICKS_PER_SEC)?
+        .checked_add(frac_ticks)
 }
 
 /// Returns `(time_part, offset_seconds)` for the text after the date.
@@ -152,5 +169,37 @@ mod tests {
     fn system_time_to_filetime_epoch() {
         let epoch = UNIX_EPOCH;
         assert_eq!(system_time_to_filetime(epoch).unwrap(), 116_444_736_000_000_000);
+    }
+
+    #[test]
+    fn system_time_before_1970_is_supported() {
+        use std::time::Duration;
+        let day_before = UNIX_EPOCH - Duration::from_secs(86_400);
+        assert_eq!(
+            system_time_to_filetime(day_before),
+            Some(116_444_736_000_000_000 - 86_400 * TICKS_PER_SEC)
+        );
+        // Windows stores SystemTime in 100 ns ticks, so step by whole ticks.
+        let one_tick = UNIX_EPOCH - Duration::from_nanos(100);
+        assert_eq!(system_time_to_filetime(one_tick), Some(116_444_735_999_999_999));
+        let windows_epoch = UNIX_EPOCH - Duration::from_secs(WINDOWS_EPOCH_DIFF_SECS as u64);
+        assert_eq!(system_time_to_filetime(windows_epoch), Some(0));
+        // Windows cannot represent this time at all; other platforms can.
+        if let Some(before_1601) = windows_epoch.checked_sub(Duration::from_secs(1)) {
+            assert_eq!(system_time_to_filetime(before_1601), None);
+        }
+    }
+
+    #[test]
+    fn iso_before_1601_is_rejected() {
+        assert_eq!(parse_iso8601("1601-01-01T00:00:00Z"), Some(0));
+        assert!(parse_iso8601("1600-12-31T23:59:59Z").is_none());
+        assert!(parse_iso8601("1601-01-01T00:30:00+01:00").is_none());
+        assert!(parse_iso8601("0000-01-01").is_none());
+        assert!(parse_iso8601("99999999999-01-01").is_none());
+        assert_eq!(
+            parse_iso8601("1969-12-31T23:59:59Z"),
+            Some(116_444_736_000_000_000 - TICKS_PER_SEC)
+        );
     }
 }
